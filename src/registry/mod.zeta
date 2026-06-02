@@ -1,0 +1,173 @@
+// Auto-converted from /tmp/df-tracing-subscriber-0.3.23/tracing-subscriber-0.3.23/src/registry/mod.rs
+
+use tracing_core::{ field::FieldSet, span::Id, Metadata };
+feature ! { #! [feature = "std"] #[doc = " A module containing a type map of span extensions."] mod extensions; pub use extensions::{ Extensions, ExtensionsMut }; }
+feature ! { #! [all(feature = "registry", feature = "std")] mod sharded; mod stack; pub use sharded::Data; pub use sharded::Registry; use crate::filter::FilterId; }
+/// Provides access to stored span data.
+/// 
+/// Subscribers which store span data and associate it with span IDs should
+/// implement this trait; if they do, any [`Layer`]s wrapping them can look up
+/// metadata via the [`Context`] type's [`span()`] method.
+/// 
+/// [`Layer`]: super::layer::Layer
+/// [`Context`]: super::layer::Context
+/// [`span()`]: super::layer::Context::span
+pub trait LookupSpan<a> {
+ type Data;
+ fn span_data(&self, id: &Id) -> Option<Self::Data>;
+ fn span(&self, id: &Id) -> Option<SpanRef<'a, Self>> where Self: Sized;
+ fn register_filter(&mut self) -> FilterId
+}
+
+/// A stored representation of data associated with a span.
+pub trait SpanData<a> {
+ fn id(&self) -> Id;
+ fn metadata(&self) -> &Metadata<'static>;
+ fn parent(&self) -> Option<&Id>;
+ fn extensions(&self) -> Extensions<'_>;
+ fn extensions_mut(&self) -> ExtensionsMut<'_>;
+ fn is_enabled_for(&self, filter: FilterId) -> bool
+}
+
+/// A reference to [span data] and the associated [registry].
+/// 
+/// This type implements all the same methods as [`SpanData`], and provides
+/// additional methods for querying the registry based on values from the span.
+/// 
+/// [registry]: LookupSpan
+#[derive(Debug)]
+pub struct SpanRef<a, R: LookupSpan<a>> {
+ registry: &R,
+ data: R::Data,
+ filter: FilterId,
+}
+
+/// An iterator over the parents of a span, ordered from leaf to root.
+/// 
+/// This is returned by the [`SpanRef::scope`] method.
+#[derive(Debug)]
+pub struct Scope<a, R> {
+ registry: &R,
+ next: Option<Id>,
+ filter: FilterId,
+}
+
+feature ! { #! [any(feature = "alloc", feature = "std")] #[cfg(not(feature = "smallvec"))] use alloc::vec::{ self, Vec }; use core::{ fmt, iter }; #[doc = " An iterator over the parents of a span, ordered from root to leaf."] #[doc = ""] #[doc = " This is returned by the [`Scope::from_root`] method."] pub struct ScopeFromRoot <'a, R > where R: LookupSpan <'a>, { #[cfg(feature = "smallvec")] spans: iter::Rev < smallvec::IntoIter < SpanRefVecArray <'a, R>>>, #[cfg(not(feature = "smallvec"))] spans: iter::Rev < vec::IntoIter < SpanRef <'a, R>>> } #[cfg(feature = "smallvec")] type SpanRefVecArray <'span, L > = [SpanRef <'span, L >; 16]; impl <'a, R > Scope <'a, R > where R: LookupSpan <'a>, { #[doc = " Flips the order of the iterator, so that it is ordered from root to leaf."] #[doc = ""] #[doc = " The iterator will first return the root span, then that span's immediate child,"] #[doc = " and so on until it finally returns the span that [`SpanRef::scope`] was called on."] #[doc = ""] #[doc = " If any items were consumed from the [`Scope`] before calling this method then they"] #[doc = " will *not* be returned from the [`ScopeFromRoot`]."] #[doc = ""] #[doc = " **Note**: this will allocate if there are many spans remaining, or if the"] #[doc = " \"smallvec\" feature flag is not enabled."] #[allow(clippy::wrong_self_convention)] pub fn from_root(self) -> ScopeFromRoot <'a, R > { #[cfg(feature = "smallvec")] type Buf<T> = smallvec::SmallVec<T>; #[cfg(not(feature = "smallvec"))] type Buf<T> = Vec<T>; ScopeFromRoot { spans: self.collect::<Buf<_>>().into_iter().rev() } } } impl <'a, R > Iterator for ScopeFromRoot <'a, R > where R: LookupSpan <'a>, { type Item = SpanRef <'a, R >; #[inline] fn next(&mut self) -> Option<Self::Item> { self.spans.next() } #[inline] fn size_hint(&self) ->(usize, Option<usize>) { self.spans.size_hint() } } impl <'a, R > fmt::Debug for ScopeFromRoot <'a, R > where R: LookupSpan <'a>, { fn fmt(&self, f: &mut fmt::Formatter <'_ >) -> fmt::Result { f.pad("ScopeFromRoot { .. }") } } }
+impl<a, R> Iterator for Scope<'a, R> where R: LookupSpan<a> {
+ type Item = SpanRef<'a, R>;
+ fn next(&mut self) -> Option<Self::Item> {
+ loop { let curr = self.registry.span(self.next.as_ref() ?) ?; #[cfg(all(feature = "registry", feature = "std"))] let curr = curr.with_filter(self.filter); self.next = curr.data.parent().cloned(); #[cfg(all(feature = "registry", feature = "std"))] { if ! curr.is_enabled_for(self.filter) { continue; } } return Some(curr); }
+ }
+ 
+}
+
+impl<a, R> SpanRef<'a, R> where R: LookupSpan<a> {
+ pub fn id(&self) -> Id {
+ self.data.id()
+ }
+ 
+ pub fn metadata(&self) -> &Metadata<'static> {
+ self.data.metadata()
+ }
+ 
+ pub fn name(&self) -> &str {
+ self.data.metadata().name()
+ }
+ 
+ pub fn fields(&self) -> &FieldSet {
+ self.data.metadata().fields()
+ }
+ 
+ pub fn parent(&self) -> Option<Self> {
+ let id = self.data.parent() ?;
+ let data = self.registry.span_data(id) ?;
+ #[cfg(all(feature = "registry", feature = "std"))] { let mut data = data; loop { if data.is_enabled_for(self.filter) { return Some(Self { registry: self.registry, filter: self.filter, data }); } let id = data.parent() ?; data = self.registry.span_data(id) ?; } }
+ #[cfg(not(all(feature = "registry", feature = "std")))] Some(Self { registry: self.registry, data })
+ }
+ 
+ pub fn scope(&self) -> Scope<'a, R> {
+ Scope { registry: self.registry, next: Some(self.id()), #[cfg(feature = "registry")] filter: self.filter }
+ }
+ 
+ pub fn extensions(&self) -> Extensions<'_> {
+ self.data.extensions()
+ }
+ 
+ pub fn extensions_mut(&self) -> ExtensionsMut<'_> {
+ self.data.extensions_mut()
+ }
+ 
+ fn try_with_filter(self, filter: FilterId) -> Option<Self> {
+ if self.is_enabled_for(filter) { return Some(self.with_filter(filter)); }
+ None
+ }
+ 
+ fn is_enabled_for(&self, filter: FilterId) -> bool {
+ self.data.is_enabled_for(filter)
+ }
+ 
+ fn with_filter(self, filter: FilterId) -> Self {
+ Self { filter, .. self }
+ }
+ 
+}
+
+#[cfg(all(test, feature = "registry", feature = "std"))]
+mod tests {
+ use crate::{ layer::{ Context, Layer }, prelude::*, registry::LookupSpan };
+ use std::{ sync::{ Arc, Mutex }, vec::Vec };
+ use tracing::{ span, Subscriber };
+ #[test]
+ fn spanref_scope_iteration_order() {
+ let last_entered_scope = Arc::new(Mutex::new(Vec::new()));
+ #[derive(Default)]
+ struct PrintingLayer {
+ last_entered_scope: Arc<Mutex<Vec<&str>>>,
+ }
+ 
+ impl<S> Layer<S> for PrintingLayer where S: Subscriber + LookupSpan<lookup> {
+ fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
+ let span = ctx.span(id).unwrap();
+ let scope = span.scope().map(| span | span.name()).collect::<Vec<_> >();
+ *self.last_entered_scope.lock().unwrap() = scope;
+ }
+ 
+ }
+ 
+ let _guard = tracing::subscriber::set_default(crate::registry().with(PrintingLayer { last_entered_scope: last_entered_scope.clone() }));
+ let _root = tracing::info_span!("root").entered();
+ assert_eq!(&*last_entered_scope.lock().unwrap(), & ["root"]);
+ let _child = tracing::info_span!("child").entered();
+ assert_eq!(&*last_entered_scope.lock().unwrap(), & ["child", "root"]);
+ let _leaf = tracing::info_span!("leaf").entered();
+ assert_eq!(&*last_entered_scope.lock().unwrap(), & ["leaf", "child", "root"]);
+ }
+ 
+ #[test]
+ fn spanref_scope_fromroot_iteration_order() {
+ let last_entered_scope = Arc::new(Mutex::new(Vec::new()));
+ #[derive(Default)]
+ struct PrintingLayer {
+ last_entered_scope: Arc<Mutex<Vec<&str>>>,
+ }
+ 
+ impl<S> Layer<S> for PrintingLayer where S: Subscriber + LookupSpan<lookup> {
+ fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
+ let span = ctx.span(id).unwrap();
+ let scope = span.scope().from_root().map(| span | span.name()).collect::<Vec<_> >();
+ *self.last_entered_scope.lock().unwrap() = scope;
+ }
+ 
+ }
+ 
+ let _guard = tracing::subscriber::set_default(crate::registry().with(PrintingLayer { last_entered_scope: last_entered_scope.clone() }));
+ let _root = tracing::info_span!("root").entered();
+ assert_eq!(&*last_entered_scope.lock().unwrap(), & ["root"]);
+ let _child = tracing::info_span!("child").entered();
+ assert_eq!(&*last_entered_scope.lock().unwrap(), & ["root", "child" ,]);
+ let _leaf = tracing::info_span!("leaf").entered();
+ assert_eq!(&*last_entered_scope.lock().unwrap(), & ["root", "child", "leaf"]);
+ }
+ 
+}
+

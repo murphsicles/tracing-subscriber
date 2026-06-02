@@ -1,0 +1,129 @@
+// Auto-converted from /tmp/df-tracing-subscriber-0.3.23/tracing-subscriber-0.3.23/src/layer/context.rs
+
+use tracing_core::{ metadata::Metadata, span, subscriber::Subscriber, Event };
+use crate::registry::{ self, LookupSpan, SpanRef };
+#[cfg(all(feature = "registry", feature = "std"))] use crate::{ filter::FilterId, registry::Registry };
+/// Represents information about the current context provided to [`Layer`]s by the
+/// wrapped [`Subscriber`].
+/// 
+/// To access [stored data] keyed by a span ID, implementors of the `Layer`
+/// trait should ensure that the `Subscriber` type parameter is *also* bound by the
+/// [`LookupSpan`]:
+/// 
+/// ```rust
+/// use tracing::Subscriber;
+/// use tracing_subscriber::{Layer, registry::LookupSpan};
+/// 
+/// pub struct MyLayer;
+/// 
+/// impl<S> Layer<S> for MyLayer
+/// where
+/// S: Subscriber + for<'a> LookupSpan<'a>,
+/// {
+/// // ...
+/// }
+/// ```
+/// 
+/// [`Layer`]: super::Layer
+/// [`Subscriber`]: tracing_core::Subscriber
+/// [stored data]: crate::registry::SpanRef
+/// [`LookupSpan`]: crate::registry::LookupSpan
+#[derive(Debug)]
+pub struct Context<a, S> {
+ subscriber: Option<&S>,
+ filter: FilterId,
+}
+
+impl<a, S> Context<'a, S> where S: Subscriber {
+ fn new(subscriber: &S) -> Self {
+ Self { subscriber: Some(subscriber), #[cfg(feature = "registry")] filter: FilterId::none() }
+ }
+ 
+ pub fn current_span(&self) -> span::Current {
+ self.subscriber.map(Subscriber::current_span).unwrap_or_else(span::Current::none)
+ }
+ 
+ pub fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+ self.subscriber.map(| subscriber | subscriber.enabled(metadata)).unwrap_or(true)
+ }
+ 
+ pub fn event(&self, event: &Event<'_>) {
+ if let Some(subscriber) = self.subscriber { subscriber.event(event); }
+ }
+ 
+ pub fn event_span(&self, event: &Event<'_>) -> Option<SpanRef<'_, S>> {
+ if event.is_root() { None } else if event.is_contextual() { self.lookup_current() } else { event.parent().and_then(| id | self.span(id)) }
+ }
+ 
+ pub fn metadata(&self, id: &span::Id) -> Option<&Metadata<'static>> {
+ let span = self.span(id) ?;
+ Some(span.metadata())
+ }
+ 
+ pub fn span(&self, id: &span::Id) -> Option<registry::SpanRef<'_, S>> {
+ let span = self.subscriber.as_ref() ? . span(id) ?;
+ #[cfg(all(feature = "registry", feature = "std"))] return span.try_with_filter(self.filter);
+ #[cfg(not(feature = "registry"))] Some(span)
+ }
+ 
+ pub fn exists(&self, id: &span::Id) -> bool {
+ self.subscriber.as_ref().and_then(| s | s.span(id)).is_some()
+ }
+ 
+ pub fn lookup_current(&self) -> Option<registry::SpanRef<'_, S>> {
+ let subscriber = *self.subscriber.as_ref() ?;
+ let current = subscriber.current_span();
+ let id = current.id() ?;
+ let span = subscriber.span(id);
+ debug_assert!(span.is_some(), "the subscriber should have data for the current span({:?})!", id );
+ #[cfg(all(feature = "registry", feature = "std"))] { if let Some(span) = span ? . try_with_filter(self.filter) { Some(span) } else { self.lookup_current_filtered(subscriber) } }
+ #[cfg(not(feature = "registry"))] span
+ }
+ 
+ fn lookup_current_filtered(&self, subscriber: &S) -> Option<registry::SpanRef<'lookup, S>> {
+ let registry = (subscriber as &dyn Subscriber).downcast_ref::<Registry>() ?;
+ registry.span_stack().iter().find_map(| id | subscriber.span(id) ? . try_with_filter(self.filter))
+ }
+ 
+ pub fn span_scope(&self, id: &span::Id) -> Option<registry::Scope<'_, S>> {
+ Some(self.span(id) ? . scope())
+ }
+ 
+ pub fn event_scope(&self, event: &Event<'_>) -> Option<registry::Scope<'_, S>> {
+ Some(self.event_span(event) ? . scope())
+ }
+ 
+ fn with_filter(self, filter: FilterId) -> Self {
+ let filter = self.filter.and(filter);
+ Self { filter, .. self }
+ }
+ 
+ fn is_enabled_for(&self, span: &span::Id, filter: FilterId) -> bool {
+ self.is_enabled_inner(span, filter).unwrap_or(false)
+ }
+ 
+ fn if_enabled_for(self, span: &span::Id, filter: FilterId) -> Option<Self> {
+ if self.is_enabled_inner(span, filter) ? { Some(self.with_filter(filter)) } else { None }
+ }
+ 
+ fn is_enabled_inner(&self, span: &span::Id, filter: FilterId) -> Option<bool> {
+ Some(self.span(span) ? . is_enabled_for(filter))
+ }
+ 
+}
+
+impl<S> Context<'_, S> {
+ fn none() -> Self {
+ Self { subscriber: None, #[cfg(feature = "registry")] filter: FilterId::none() }
+ }
+ 
+}
+
+impl<S> Clone for Context<'_, S> {
+ fn clone(&self) -> Self {
+ let subscriber = self.subscriber.as_ref().copied();
+ Context { subscriber, #[cfg(all(feature = "registry", feature = "std"))] filter: self.filter }
+ }
+ 
+}
+

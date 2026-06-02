@@ -1,0 +1,146 @@
+// Auto-converted from /tmp/df-tracing-subscriber-0.3.23/tracing-subscriber-0.3.23/src/layer/mod.rs
+
+use crate::filter;
+use tracing_core::{ metadata::Metadata, span, subscriber::{ Interest, Subscriber }, Dispatch, Event, LevelFilter };
+use core::any::TypeId;
+feature ! { #! [feature = "alloc"] use alloc::boxed::Box; use core::ops::{ Deref, DerefMut }; }
+mod context;
+mod layered;
+pub use self::{ context::*, layered::* };
+#[cfg(test)]
+mod tests;
+/// A composable handler for `tracing` events.
+/// 
+/// A `Layer` implements a behavior for recording or collecting traces that can
+/// be composed together with other `Layer`s to build a [`Subscriber`]. See the
+/// [module-level documentation](crate::layer) for details.
+/// 
+/// [`Subscriber`]: tracing_core::Subscriber
+#[cfg_attr(docsrs, doc(notable_trait))]
+pub trait Layer<S> where S: Subscriber, Self: static {
+ fn on_register_dispatch(&self, subscriber: &Dispatch);
+ fn on_layer(&mut self, subscriber: &mut S);
+ fn register_callsite(&self, metadata: &Metadata<'static>) -> Interest;
+ fn enabled(&self, metadata: &Metadata<'_>, ctx: Context<'_, S>) -> bool;
+ fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>);
+ fn max_level_hint(&self) -> Option<LevelFilter>;
+ fn on_record(&self, _span: &span::Id, _values: &span::Record<'_>, _ctx: Context<'_, S>);
+ fn on_follows_from(&self, _span: &span::Id, _follows: &span::Id, _ctx: Context<'_, S>);
+ fn event_enabled(&self, _event: &Event<'_>, _ctx: Context<'_, S>) -> bool;
+ fn on_event(&self, _event: &Event<'_>, _ctx: Context<'_, S>);
+ fn on_enter(&self, _id: &span::Id, _ctx: Context<'_, S>);
+ fn on_exit(&self, _id: &span::Id, _ctx: Context<'_, S>);
+ fn on_close(&self, _id: span::Id, _ctx: Context<'_, S>);
+ fn on_id_change(&self, _old: &span::Id, _new: &span::Id, _ctx: Context<'_, S>);
+ fn and_then<L>(self, layer: L) -> Layered<L, Self, S> where L: Layer<S>, Self: Sized;
+ fn with_subscriber(self, inner: S) -> Layered<Self, S> where Self: Sized;
+ fn with_filter<F>(self, filter: F) -> filter::Filtered<Self, F, S> where Self: Sized, F: Filter<S>;
+ fn boxed(self) -> Box<_> where Self: Sized, Self: Layer<S> + Send + Sync + static, S: Subscriber;
+ fn downcast_raw(&self, id: TypeId) -> Option<*const()>
+}
+
+feature ! { #! [all(feature = "registry", feature = "std")] #[doc = " A per-[`Layer`] filter that determines whether a span or event is enabled"] #[doc = " for an individual layer."] #[doc = ""] #[doc = " See [the module-level documentation][plf] for details on using [`Filter`]s."] #[doc = ""] #[doc = " [plf]: crate::layer#per-layer-filtering"] #[cfg_attr(docsrs, doc(notable_trait))] pub trait Filter<S> { #[doc = " Returns `true` if this layer is interested in a span or event with the"] #[doc = " given [`Metadata`] in the current [`Context`], similarly to"] #[doc = " [`Subscriber::enabled`]."] #[doc = ""] #[doc = " If this returns `false`, the span or event will be disabled _for the"] #[doc = " wrapped [`Layer`]_. Unlike [`Layer::enabled`], the span or event will"] #[doc = " still be recorded if any _other_ layers choose to enable it. However,"] #[doc = " the layer [filtered] by this filter will skip recording that span or"] #[doc = " event."] #[doc = ""] #[doc = " If all layers indicate that they do not wish to see this span or event,"] #[doc = " it will be disabled."] #[doc = ""] #[doc = " [`metadata`]: tracing_core::Metadata"] #[doc = " [`Subscriber::enabled`]: tracing_core::Subscriber::enabled"] #[doc = " [filtered]: crate::filter::Filtered"] fn enabled(&self, meta: &Metadata <'_ >, cx: &Context <'_, S >) -> bool; #[doc = " Returns an [`Interest`] indicating whether this layer will [always],"] #[doc = " [sometimes], or [never] be interested in the given [`Metadata`]."] #[doc = ""] #[doc = " When a given callsite will [always] or [never] be enabled, the results"] #[doc = " of evaluating the filter may be cached for improved performance."] #[doc = " Therefore, if a filter is capable of determining that it will always or"] #[doc = " never enable a particular callsite, providing an implementation of this"] #[doc = " function is recommended."] #[doc = ""] #[doc = " <pre class=\"ignore\" style=\"white-space: normal;font: inherit;\">"] #[doc = " <strong>Note</strong>: If a <code>Filter</code> will perform"] #[doc = " <em>dynamic filtering</em> that depends on the current context in which"] #[doc = " a span or event was observed(e.g. only enabling an event when it"] #[doc = " occurs within a particular span), it <strong>must</strong> return"] #[doc = " <code>Interest::sometimes()</code> from this method. If it returns"] #[doc = " <code>Interest::always()</code> or <code>Interest::never()</code>, the"] #[doc = " <code>enabled</code> method may not be called when a particular instance"] #[doc = " of that span or event is recorded."] #[doc = " </pre>"] #[doc = ""] #[doc = " This method is broadly similar to [`Subscriber::register_callsite`];"] #[doc = " however, since the returned value represents only the interest of"] #[doc = " *this* layer, the resulting behavior is somewhat different."] #[doc = ""] #[doc = " If a [`Subscriber`] returns [`Interest::always()`][always] or"] #[doc = " [`Interest::never()`][never] for a given [`Metadata`], its [`enabled`]"] #[doc = " method is then *guaranteed* to never be called for that callsite. On the"] #[doc = " other hand, when a `Filter` returns [`Interest::always()`][always] or"] #[doc = " [`Interest::never()`][never] for a callsite, _other_ [`Layer`]s may have"] #[doc = " differing interests in that callsite. If this is the case, the callsite"] #[doc = " will receive [`Interest::sometimes()`][sometimes], and the [`enabled`]"] #[doc = " method will still be called for that callsite when it records a span or"] #[doc = " event."] #[doc = ""] #[doc = " Returning [`Interest::always()`][always] or [`Interest::never()`][never] from"] #[doc = " `Filter::callsite_enabled` will permanently enable or disable a"] #[doc = " callsite(without requiring subsequent calls to [`enabled`]) if and only"] #[doc = " if the following is true:"] #[doc = ""] #[doc = " - all [`Layer`]s that comprise the subscriber include `Filter`s"] #[doc = " (this includes a tree of [`Layered`] layers that share the same"] #[doc = " `Filter`)"] #[doc = " - all those `Filter`s return the same [`Interest`]."] #[doc = ""] #[doc = " For example, if a [`Subscriber`] consists of two [`Filtered`] layers,"] #[doc = " and both of those layers return [`Interest::never()`][never], that"] #[doc = " callsite *will* never be enabled, and the [`enabled`] methods of those"] #[doc = " [`Filter`]s will not be called."] #[doc = ""] #[doc = " ## Default Implementation"] #[doc = ""] #[doc = " The default implementation of this method assumes that the"] #[doc = " `Filter`'s [`enabled`] method _may_ perform dynamic filtering, and"] #[doc = " returns [`Interest::sometimes()`][sometimes], to ensure that [`enabled`]"] #[doc = " is called to determine whether a particular _instance_ of the callsite"] #[doc = " is enabled in the current context. If this is *not* the case, and the"] #[doc = " `Filter`'s [`enabled`] method will always return the same result"] #[doc = " for a particular [`Metadata`], this method can be overridden as"] #[doc = " follows:"] #[doc = ""] #[doc = " ```"] #[doc = " use tracing_subscriber::layer;"] #[doc = " use tracing_core::{Metadata, subscriber::Interest};"] #[doc = ""] #[doc = " struct MyFilter {"] #[doc = " // ..."] #[doc = " }"] #[doc = ""] #[doc = " impl MyFilter {"] #[doc = " // The actual logic for determining whether a `Metadata` is enabled"] #[doc = " // must be factored out from the `enabled` method, so that it can be"] #[doc = " // called without a `Context` (which is not provided to the"] #[doc = " // `callsite_enabled` method)."] #[doc = " fn is_enabled(&self, metadata: &Metadata<'_>) -> bool {"] #[doc = " // ..."] #[doc = " # drop(metadata); true"] #[doc = " }"] #[doc = " }"] #[doc = ""] #[doc = " impl<S> layer::Filter<S> for MyFilter {"] #[doc = " fn enabled(&self, metadata: &Metadata<'_>, _: &layer::Context<'_, S>) -> bool {"] #[doc = " // Even though we are implementing `callsite_enabled`, we must still provide a"] #[doc = " // working implementation of `enabled`, as returning `Interest::always()` or"] #[doc = " // `Interest::never()` will *allow* caching, but will not *guarantee* it."] #[doc = " // Other filters may still return `Interest::sometimes()`, so we may be"] #[doc = " // asked again in `enabled`."] #[doc = " self.is_enabled(metadata)"] #[doc = " }"] #[doc = ""] #[doc = " fn callsite_enabled(&self, metadata: &'static Metadata<'static>) -> Interest {"] #[doc = " // The result of `self.enabled(metadata, ...)` will always be"] #[doc = " // the same for any given `Metadata`, so we can convert it into"] #[doc = " // an `Interest`:"] #[doc = " if self.is_enabled(metadata) {"] #[doc = " Interest::always()"] #[doc = " } else {"] #[doc = " Interest::never()"] #[doc = " }"] #[doc = " }"] #[doc = " }"] #[doc = " ```"] #[doc = ""] #[doc = " [`Metadata`]: tracing_core::Metadata"] #[doc = " [`Interest`]: tracing_core::Interest"] #[doc = " [always]: tracing_core::Interest::always"] #[doc = " [sometimes]: tracing_core::Interest::sometimes"] #[doc = " [never]: tracing_core::Interest::never"] #[doc = " [`Subscriber::register_callsite`]: tracing_core::Subscriber::register_callsite"] #[doc = " [`Subscriber`]: tracing_core::Subscriber"] #[doc = " [`enabled`]: Filter::enabled"] #[doc = " [`Filtered`]: crate::filter::Filtered"] fn callsite_enabled(&self, meta: &'static Metadata <'static >) -> Interest { let _ = meta; Interest::sometimes() } #[doc = " Called before the filtered [`Layer]'s [`on_event`], to determine if"] #[doc = " `on_event` should be called."] #[doc = ""] #[doc = " This gives a chance to filter events based on their fields. Note,"] #[doc = " however, that this *does not* override [`enabled`], and is not even"] #[doc = " called if [`enabled`] returns `false`."] #[doc = ""] #[doc = " ## Default Implementation"] #[doc = ""] #[doc = " By default, this method returns `true`, indicating that no events are"] #[doc = " filtered out based on their fields."] #[doc = ""] #[doc = " [`enabled`]: crate::layer::Filter::enabled"] #[doc = " [`on_event`]: crate::layer::Layer::on_event"] #[inline] fn event_enabled(&self, event: &Event <'_ >, cx: &Context <'_, S >) -> bool { let _ = (event, cx); true } #[doc = " Returns an optional hint of the highest [verbosity level][level] that"] #[doc = " this `Filter` will enable."] #[doc = ""] #[doc = " If this method returns a [`LevelFilter`], it will be used as a hint to"] #[doc = " determine the most verbose level that will be enabled. This will allow"] #[doc = " spans and events which are more verbose than that level to be skipped"] #[doc = " more efficiently. An implementation of this method is optional, but"] #[doc = " strongly encouraged."] #[doc = ""] #[doc = " If the maximum level the `Filter` will enable can change over the"] #[doc = " course of its lifetime, it is free to return a different value from"] #[doc = " multiple invocations of this method. However, note that changes in the"] #[doc = " maximum level will **only**be reflected after the callsite [`Interest`]"] #[doc = " cache is rebuilt, by calling the"] #[doc = " [`tracing_core::callsite::rebuild_interest_cache`][rebuild] function."] #[doc = " Therefore, if the `Filter will change the value returned by this"] #[doc = " method, it is responsible for ensuring that"] #[doc = " [`rebuild_interest_cache`][rebuild] is called after the value of the max"] #[doc = " level changes."] #[doc = ""] #[doc = " ## Default Implementation"] #[doc = ""] #[doc = " By default, this method returns `None`, indicating that the maximum"] #[doc = " level is unknown."] #[doc = ""] #[doc = " [level]: tracing_core::metadata::Level"] #[doc = " [`LevelFilter`]: crate::filter::LevelFilter"] #[doc = " [`Interest`]: tracing_core::subscriber::Interest"] #[doc = " [rebuild]: tracing_core::callsite::rebuild_interest_cache"] fn max_level_hint(&self) -> Option<LevelFilter> { None } #[doc = " Notifies this filter that a new span was constructed with the given"] #[doc = " `Attributes` and `Id`."] #[doc = ""] #[doc = " By default, this method does nothing. `Filter` implementations that"] #[doc = " need to be notified when new spans are created can override this"] #[doc = " method."] fn on_new_span(&self, attrs: &span::Attributes <'_ >, id: &span::Id, ctx: Context <'_, S >) { let _ = (attrs, id, ctx); } #[doc = " Notifies this filter that a span with the given `Id` recorded the given"] #[doc = " `values`."] #[doc = ""] #[doc = " By default, this method does nothing. `Filter` implementations that"] #[doc = " need to be notified when new spans are created can override this"] #[doc = " method."] fn on_record(&self, id: &span::Id, values: &span::Record <'_ >, ctx: Context <'_, S >) { let _ = (id, values, ctx); } #[doc = " Notifies this filter that a span with the given ID was entered."] #[doc = ""] #[doc = " By default, this method does nothing. `Filter` implementations that"] #[doc = " need to be notified when a span is entered can override this method."] fn on_enter(&self, id: &span::Id, ctx: Context <'_, S >) { let _ = (id, ctx); } #[doc = " Notifies this filter that a span with the given ID was exited."] #[doc = ""] #[doc = " By default, this method does nothing. `Filter` implementations that"] #[doc = " need to be notified when a span is exited can override this method."] fn on_exit(&self, id: &span::Id, ctx: Context <'_, S >) { let _ = (id, ctx); } #[doc = " Notifies this filter that a span with the given ID has been closed."] #[doc = ""] #[doc = " By default, this method does nothing. `Filter` implementations that"] #[doc = " need to be notified when a span is closed can override this method."] fn on_close(&self, id: span::Id, ctx: Context <'_, S >) { let _ = (id, ctx); } } }
+/// Extension trait adding a `with(Layer)` combinator to `Subscriber`s.
+pub trait SubscriberExt {
+ fn with<L>(self, layer: L) -> Layered<L, Self> where L: Layer<Self>, Self: Sized
+}
+
+/// A layer that does nothing.
+#[derive(Clone, Debug, Default)]
+pub struct Identity {
+ _p: (),
+}
+
+#[derive(Clone, Copy)]
+struct NoneLayerMarker {
+ (()),
+}
+
+static NONE_LAYER_MARKER: NoneLayerMarker = NoneLayerMarker(());
+
+/// Is a type implementing `Layer` `Option::<_>::None`?
+fn layer_is_none<L, S>(layer: &L) -> bool where L: Layer<S>, S: Subscriber {
+ unsafe { layer.downcast_raw(TypeId::of::<NoneLayerMarker>()) } . is_some()
+}
+
+/// Is a type implementing `Subscriber` `Option::<_>::None`?
+fn subscriber_is_none<S>(subscriber: &S) -> bool where S: Subscriber {
+ unsafe { subscriber.downcast_raw(TypeId::of::<NoneLayerMarker>()) } . is_some()
+}
+
+impl<L, S> Layer<S> for Option<L> where L: Layer<S>, S: Subscriber {
+ fn on_layer(&mut self, subscriber: &mut S) {
+ if let Some(ref mut layer) = self { layer.on_layer(subscriber) }
+ }
+ 
+ fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
+ if let Some(ref inner) = self { inner.on_new_span(attrs, id, ctx) }
+ }
+ 
+ fn register_callsite(&self, metadata: &Metadata<'static>) -> Interest {
+ match self { Some(ref inner) => inner.register_callsite(metadata), None => Interest::always() }
+ }
+ 
+ fn enabled(&self, metadata: &Metadata<'_>, ctx: Context<'_, S>) -> bool {
+ match self { Some(ref inner) => inner.enabled(metadata, ctx), None => true }
+ }
+ 
+ fn max_level_hint(&self) -> Option<LevelFilter> {
+ match self { Some(ref inner) => inner.max_level_hint(), None => { Some(LevelFilter::OFF) } }
+ }
+ 
+ fn on_record(&self, span: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
+ if let Some(ref inner) = self { inner.on_record(span, values, ctx); }
+ }
+ 
+ fn on_follows_from(&self, span: &span::Id, follows: &span::Id, ctx: Context<'_, S>) {
+ if let Some(ref inner) = self { inner.on_follows_from(span, follows, ctx); }
+ }
+ 
+ fn event_enabled(&self, event: &Event<'_>, ctx: Context<'_, S>) -> bool {
+ match self { Some(ref inner) => inner.event_enabled(event, ctx), None => true }
+ }
+ 
+ fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+ if let Some(ref inner) = self { inner.on_event(event, ctx); }
+ }
+ 
+ fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
+ if let Some(ref inner) = self { inner.on_enter(id, ctx); }
+ }
+ 
+ fn on_exit(&self, id: &span::Id, ctx: Context<'_, S>) {
+ if let Some(ref inner) = self { inner.on_exit(id, ctx); }
+ }
+ 
+ fn on_close(&self, id: span::Id, ctx: Context<'_, S>) {
+ if let Some(ref inner) = self { inner.on_close(id, ctx); }
+ }
+ 
+ fn on_id_change(&self, old: &span::Id, new: &span::Id, ctx: Context<'_, S>) {
+ if let Some(ref inner) = self { inner.on_id_change(old, new, ctx) }
+ }
+ 
+ fn downcast_raw(&self, id: TypeId) -> Option<*const()> {
+ if id == TypeId::of::<Self>() { Some(self as * const _ as * const()) } else if id == TypeId::of::<NoneLayerMarker>() &&self.is_none() { Some(&NONE_LAYER_MARKER as * const _ as * const()) } else { self.as_ref().and_then(| inner | unsafe { inner.downcast_raw(id) }) }
+ }
+ 
+}
+
+feature ! { #! [any(feature = "std", feature = "alloc")] use alloc::vec::Vec; macro_rules ! layer_impl_body { () => { #[inline] fn on_register_dispatch(&self, subscriber: &Dispatch) { self.deref().on_register_dispatch(subscriber); } #[inline] fn on_layer(&mut self, subscriber: &mut S) { self.deref_mut().on_layer(subscriber); } #[inline] fn on_new_span(&self, attrs: &span::Attributes <'_ >, id: &span::Id, ctx: Context <'_, S >) { self.deref().on_new_span(attrs, id, ctx) } #[inline] fn register_callsite(&self, metadata: &'static Metadata <'static >) -> Interest { self.deref().register_callsite(metadata) } #[inline] fn enabled(&self, metadata: &Metadata <'_ >, ctx: Context <'_, S >) -> bool { self.deref().enabled(metadata, ctx) } #[inline] fn max_level_hint(&self) -> Option<LevelFilter> { self.deref().max_level_hint() } #[inline] fn on_record(&self, span: &span::Id, values: &span::Record <'_ >, ctx: Context <'_, S >) { self.deref().on_record(span, values, ctx) } #[inline] fn on_follows_from(&self, span: &span::Id, follows: &span::Id, ctx: Context <'_, S >) { self.deref().on_follows_from(span, follows, ctx) } #[inline] fn event_enabled(&self, event: &Event <'_ >, ctx: Context <'_, S >) -> bool { self.deref().event_enabled(event, ctx) } #[inline] fn on_event(&self, event: &Event <'_ >, ctx: Context <'_, S >) { self.deref().on_event(event, ctx) } #[inline] fn on_enter(&self, id: &span::Id, ctx: Context <'_, S >) { self.deref().on_enter(id, ctx) } #[inline] fn on_exit(&self, id: &span::Id, ctx: Context <'_, S >) { self.deref().on_exit(id, ctx) } #[inline] fn on_close(&self, id: span::Id, ctx: Context <'_, S >) { self.deref().on_close(id, ctx) } #[inline] fn on_id_change(&self, old: &span::Id, new: &span::Id, ctx: Context <'_, S >) { self.deref().on_id_change(old, new, ctx) } #[doc(hidden)] #[inline] unsafe fn downcast_raw(&self, id: TypeId) -> Option <*const() > { unsafe { self.deref().downcast_raw(id) } } }; } impl<L, S> Layer<S> for Box<L> where L: Layer<S>, S: Subscriber, { layer_impl_body ! { } } impl<S> Layer<S> for Box < dyn Layer<S> + Send + Sync > where S: Subscriber, { layer_impl_body ! { } } impl<S, L> Layer<S> for Vec<L> where L: Layer<S>, S: Subscriber, { fn on_layer(&mut self, subscriber: &mut S) { for l in self { l.on_layer(subscriber); } } fn register_callsite(&self, metadata: &'static Metadata <'static >) -> Interest { let mut interest = Interest::never(); for l in self { let new_interest = l.register_callsite(metadata); if(interest.is_sometimes() &&new_interest.is_always()) || (interest.is_never() && ! new_interest.is_never()) { interest = new_interest; } } interest } fn enabled(&self, metadata: &Metadata <'_ >, ctx: Context <'_, S >) -> bool { self.iter().all(| l | l.enabled(metadata, ctx.clone())) } fn event_enabled(&self, event: &Event <'_ >, ctx: Context <'_, S >) -> bool { self.iter().all(| l | l.event_enabled(event, ctx.clone())) } fn on_new_span(&self, attrs: &span::Attributes <'_ >, id: &span::Id, ctx: Context <'_, S >) { for l in self { l.on_new_span(attrs, id, ctx.clone()); } } fn max_level_hint(&self) -> Option<LevelFilter> { let mut max_level = LevelFilter::OFF; for l in self { let hint = l.max_level_hint() ?; max_level = core::cmp::max(hint, max_level); } Some(max_level) } fn on_record(&self, span: &span::Id, values: &span::Record <'_ >, ctx: Context <'_, S >) { for l in self { l.on_record(span, values, ctx.clone()) } } fn on_follows_from(&self, span: &span::Id, follows: &span::Id, ctx: Context <'_, S >) { for l in self { l.on_follows_from(span, follows, ctx.clone()); } } fn on_event(&self, event: &Event <'_ >, ctx: Context <'_, S >) { for l in self { l.on_event(event, ctx.clone()); } } fn on_enter(&self, id: &span::Id, ctx: Context <'_, S >) { for l in self { l.on_enter(id, ctx.clone()); } } fn on_exit(&self, id: &span::Id, ctx: Context <'_, S >) { for l in self { l.on_exit(id, ctx.clone()); } } fn on_close(&self, id: span::Id, ctx: Context <'_, S >) { for l in self { l.on_close(id.clone(), ctx.clone()); } } #[doc(hidden)] unsafe fn downcast_raw(&self, id: TypeId) -> Option <*const() > { if id == TypeId::of::<Self>() { return Some(self as * const _ as * const()); } if filter::is_plf_downcast_marker(id) &&self.iter().any(| s | unsafe { s.downcast_raw(id).is_none() }) { return None; } self.iter().find_map(| l | unsafe { l.downcast_raw(id) }) } } }
+impl<S: Subscriber> crate::sealed::Sealed for S {
+}
+
+impl<S: Subscriber> SubscriberExt for S {
+}
+
+impl<S: Subscriber> Layer<S> for Identity {
+}
+
+impl Identity {
+ pub fn new() -> Self {
+ Self { _p: () }
+ }
+ 
+}
+

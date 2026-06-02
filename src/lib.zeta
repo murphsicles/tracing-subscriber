@@ -1,0 +1,23 @@
+// Auto-converted from /tmp/df-tracing-subscriber-0.3.23/tracing-subscriber-0.3.23/src/lib.rs
+
+// [unsupported item]
+// [unsupported item]
+#[macro_use]
+mod macros;
+pub mod field;
+pub mod filter;
+pub mod prelude;
+pub mod registry;
+pub mod layer;
+pub mod util;
+feature ! { #! [feature = "std"] pub mod reload; pub(crate) mod sync; }
+feature ! { #! [all(feature = "fmt", feature = "std")] pub mod fmt; pub use fmt::fmt; pub use fmt::Subscriber as FmtSubscriber; }
+feature ! { #! [all(feature = "env-filter", feature = "std")] pub use filter::EnvFilter; }
+pub use layer::Layer;
+feature ! { #! [all(feature = "registry", feature = "std")] pub use registry::Registry; #[doc = " Returns a default [`Registry`]."] pub fn registry() -> Registry { Registry::default() } }
+mod sealed {
+ pub trait Sealed<A> {
+ }
+ 
+}
+

@@ -1,0 +1,545 @@
+// Auto-converted from /tmp/df-tracing-subscriber-0.3.23/tracing-subscriber-0.3.23/src/fmt/mod.rs
+
+use alloc::boxed::Box;
+use core::any::TypeId;
+use std::{ error::Error, io };
+use tracing_core::{ span, subscriber::Interest, Event, Metadata };
+mod fmt_layer;
+#[cfg_attr(docsrs, doc(cfg(all(feature = "fmt", feature = "std"))))]
+pub mod format;
+#[cfg_attr(docsrs, doc(cfg(all(feature = "fmt", feature = "std"))))]
+pub mod time;
+#[cfg_attr(docsrs, doc(cfg(all(feature = "fmt", feature = "std"))))]
+pub mod writer;
+pub use fmt_layer::{ FmtContext, FormattedFields, Layer };
+use crate::layer::Layer as _;
+use crate::util::SubscriberInitExt;
+use crate::{ filter::LevelFilter, layer, registry::{ LookupSpan, Registry } };
+#[doc(inline)] pub use self::{ format::{ format, FormatEvent, FormatFields }, time::time, writer::{ MakeWriter, TestWriter } };
+/// A `Subscriber` that logs formatted representations of `tracing` events.
+/// 
+/// This consists of an inner `Formatter` wrapped in a layer that performs filtering.
+#[cfg_attr(docsrs, doc(cfg(all(feature = "fmt", feature = "std"))))]
+#[derive(Debug)]
+pub struct Subscriber<N, E, F, W> {
+ inner: layer::Layered<F, Formatter<N, E, W>>,
+}
+
+pub type Formatter<N, E, W> = layer::Layered<fmt_layer::Layer<Registry, N, E, W>, Registry>;
+
+/// Configures and constructs `Subscriber`s.
+#[cfg_attr(docsrs, doc(cfg(all(feature = "fmt", feature = "std"))))]
+#[derive(Debug)]
+#[must_use]
+pub struct SubscriberBuilder<N, E, F, W> {
+ filter: F,
+ inner: Layer<Registry, N, E, W>,
+}
+
+/// Returns a new [`SubscriberBuilder`] for configuring a [formatting subscriber].
+/// 
+/// This is essentially shorthand for [`SubscriberBuilder::default()]`.
+/// 
+/// # Examples
+/// 
+/// Using [`init`] to set the default subscriber:
+/// 
+/// ```rust
+/// tracing_subscriber::fmt().init();
+/// ```
+/// 
+/// Configuring the output format:
+/// 
+/// ```rust
+/// 
+/// tracing_subscriber::fmt()
+/// // Configure formatting settings.
+/// .with_target(false)
+/// .with_timer(tracing_subscriber::fmt::time::uptime())
+/// .with_level(true)
+/// // Set the subscriber as the default.
+/// .init();
+/// ```
+/// 
+/// [`try_init`] returns an error if the default subscriber could not be set:
+/// 
+/// ```rust
+/// use std::error::Error;
+/// 
+/// fn init_subscriber() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+/// tracing_subscriber::fmt()
+/// // Configure the subscriber to emit logs in JSON format.
+/// .json()
+/// // Configure the subscriber to flatten event fields in the output JSON objects.
+/// .flatten_event(true)
+/// // Set the subscriber as the default, returning an error if this fails.
+/// .try_init()?;
+/// 
+/// Ok(())
+/// }
+/// ```
+/// 
+/// Rather than setting the subscriber as the default, [`finish`] _returns_ the
+/// constructed subscriber, which may then be passed to other functions:
+/// 
+/// ```rust
+/// let subscriber = tracing_subscriber::fmt()
+/// .with_max_level(tracing::Level::DEBUG)
+/// .compact()
+/// .finish();
+/// 
+/// tracing::subscriber::with_default(subscriber, || {
+/// // the subscriber will only be set as the default
+/// // inside this closure...
+/// })
+/// ```
+/// 
+/// [formatting subscriber]: Subscriber
+/// [`SubscriberBuilder::default()`]: SubscriberBuilder::default
+/// [`init`]: SubscriberBuilder::init()
+/// [`try_init`]: SubscriberBuilder::try_init()
+/// [`finish`]: SubscriberBuilder::finish()
+#[cfg_attr(docsrs, doc(cfg(all(feature = "fmt", feature = "std"))))]
+pub fn fmt() -> SubscriberBuilder {
+ SubscriberBuilder::default()
+}
+
+/// Returns a new [formatting layer] that can be [composed] with other layers to
+/// construct a [`Subscriber`].
+/// 
+/// This is a shorthand for the equivalent [`Layer::default()`] function.
+/// 
+/// [formatting layer]: Layer
+/// [composed]: crate::layer
+/// [`Layer::default()`]: Layer::default
+#[cfg_attr(docsrs, doc(cfg(all(feature = "fmt", feature = "std"))))]
+pub fn layer<S>() -> Layer<S> {
+ Layer::default()
+}
+
+impl Subscriber {
+ const DEFAULT_MAX_LEVEL: LevelFilter = LevelFilter::INFO;
+ pub fn builder() -> SubscriberBuilder {
+ SubscriberBuilder::default()
+ }
+ 
+ pub fn new() -> Self {
+ Default::default()
+ }
+ 
+}
+
+impl Default for Subscriber {
+ fn default() -> Self {
+ SubscriberBuilder::default().finish()
+ }
+ 
+}
+
+impl<N, E, F, W> tracing_core::Subscriber for Subscriber<N, E, F, W> where N: FormatFields<writer> + static, E: FormatEvent<Registry, N> + static, F: layer::Layer<Formatter<N, E, W>> + static, W: MakeWriter<writer> + static, layer::Layered<F, Formatter<N, E, W>>: tracing_core::Subscriber, fmt_layer::Layer<Registry, N, E, W>: layer::Layer<Registry> {
+ fn register_callsite(&self, meta: &Metadata<'static>) -> Interest {
+ self.inner.register_callsite(meta)
+ }
+ 
+ fn enabled(&self, meta: &Metadata<'_>) -> bool {
+ self.inner.enabled(meta)
+ }
+ 
+ fn new_span(&self, attrs: &span::Attributes<'_>) -> span::Id {
+ self.inner.new_span(attrs)
+ }
+ 
+ fn record(&self, span: &span::Id, values: &span::Record<'_>) {
+ self.inner.record(span, values)
+ }
+ 
+ fn record_follows_from(&self, span: &span::Id, follows: &span::Id) {
+ self.inner.record_follows_from(span, follows)
+ }
+ 
+ fn event_enabled(&self, event: &Event<'_>) -> bool {
+ self.inner.event_enabled(event)
+ }
+ 
+ fn event(&self, event: &Event<'_>) {
+ self.inner.event(event);
+ }
+ 
+ fn enter(&self, id: &span::Id) {
+ self.inner.enter(id);
+ }
+ 
+ fn exit(&self, id: &span::Id) {
+ self.inner.exit(id);
+ }
+ 
+ fn current_span(&self) -> span::Current {
+ self.inner.current_span()
+ }
+ 
+ fn clone_span(&self, id: &span::Id) -> span::Id {
+ self.inner.clone_span(id)
+ }
+ 
+ fn try_close(&self, id: span::Id) -> bool {
+ self.inner.try_close(id)
+ }
+ 
+ fn max_level_hint(&self) -> Option<tracing_core::LevelFilter> {
+ self.inner.max_level_hint()
+ }
+ 
+ fn downcast_raw(&self, id: TypeId) -> Option<*const()> {
+ if id == TypeId::of::<Self>() { Some(self as * const Self as * const()) } else { unsafe { self.inner.downcast_raw(id) } }
+ }
+ 
+}
+
+impl<a, N, E, F, W> LookupSpan<a> for Subscriber<N, E, F, W> where layer::Layered<F, Formatter<N, E, W>>: LookupSpan<a> {
+ type Data = LookupSpan<'a>::Data;
+ fn span_data(&self, id: &span::Id) -> Option<Self::Data> {
+ self.inner.span_data(id)
+ }
+ 
+}
+
+impl Default for SubscriberBuilder {
+ fn default() -> Self {
+ SubscriberBuilder { filter: Subscriber::DEFAULT_MAX_LEVEL, inner: Default::default() } . log_internal_errors(true)
+ }
+ 
+}
+
+impl<N, E, F, W> SubscriberBuilder<N, E, F, W> where N: FormatFields<writer> + static, E: FormatEvent<Registry, N> + static, W: MakeWriter<writer> + static, F: layer::Layer<Formatter<N, E, W>> + Send + Sync + static, fmt_layer::Layer<Registry, N, E, W>: layer::Layer<Registry> + Send + Sync + static {
+ pub fn finish(self) -> Subscriber<N, E, F, W> {
+ let subscriber = self.inner.with_subscriber(Registry::default());
+ Subscriber { inner: self.filter.with_subscriber(subscriber) }
+ }
+ 
+ pub fn try_init(self) -> Result<(), Box<_>> {
+ use crate::util::SubscriberInitExt;
+ self.finish().try_init() ?;
+ Ok(())
+ }
+ 
+ pub fn init(self) {
+ self.try_init().expect("Unable to install global subscriber")
+ }
+ 
+}
+
+impl<N, E, F, W> From<SubscriberBuilder<N, E, F, W>> for tracing_core::Dispatch where N: FormatFields<writer> + static, E: FormatEvent<Registry, N> + static, W: MakeWriter<writer> + static, F: layer::Layer<Formatter<N, E, W>> + Send + Sync + static, fmt_layer::Layer<Registry, N, E, W>: layer::Layer<Registry> + Send + Sync + static {
+ fn from(builder: SubscriberBuilder<N, E, F, W>) -> tracing_core::Dispatch {
+ tracing_core::Dispatch::new(builder.finish())
+ }
+ 
+}
+
+impl<N, L, T, F, W> SubscriberBuilder<N, format::Format<L, T>, F, W> where N: FormatFields<writer> + static {
+ pub fn with_timer(self, timer: T2) -> SubscriberBuilder<N, format::Format<L, T2>, F, W> {
+ SubscriberBuilder { filter: self.filter, inner: self.inner.with_timer(timer) }
+ }
+ 
+ pub fn without_time(self) -> SubscriberBuilder<N, format::Format<L, ()>, F, W> {
+ SubscriberBuilder { filter: self.filter, inner: self.inner.without_time() }
+ }
+ 
+ pub fn with_span_events(self, kind: format::FmtSpan) -> Self {
+ SubscriberBuilder { inner: self.inner.with_span_events(kind), .. self }
+ }
+ 
+ pub fn with_ansi(self, ansi: bool) -> SubscriberBuilder<N, format::Format<L, T>, F, W> {
+ SubscriberBuilder { inner: self.inner.with_ansi(ansi), .. self }
+ }
+ 
+ pub fn with_ansi_sanitization(self, ansi_sanitization: bool) -> SubscriberBuilder<N, format::Format<L, T>, F, W> {
+ SubscriberBuilder { inner: self.inner.with_ansi_sanitization(ansi_sanitization), .. self }
+ }
+ 
+ pub fn log_internal_errors(self, log_internal_errors: bool) -> SubscriberBuilder<N, format::Format<L, T>, F, W> {
+ SubscriberBuilder { inner: self.inner.log_internal_errors(log_internal_errors), .. self }
+ }
+ 
+ pub fn with_target(self, display_target: bool) -> SubscriberBuilder<N, format::Format<L, T>, F, W> {
+ SubscriberBuilder { inner: self.inner.with_target(display_target), .. self }
+ }
+ 
+ pub fn with_file(self, display_filename: bool) -> SubscriberBuilder<N, format::Format<L, T>, F, W> {
+ SubscriberBuilder { inner: self.inner.with_file(display_filename), .. self }
+ }
+ 
+ pub fn with_line_number(self, display_line_number: bool) -> SubscriberBuilder<N, format::Format<L, T>, F, W> {
+ SubscriberBuilder { inner: self.inner.with_line_number(display_line_number), .. self }
+ }
+ 
+ pub fn with_level(self, display_level: bool) -> SubscriberBuilder<N, format::Format<L, T>, F, W> {
+ SubscriberBuilder { inner: self.inner.with_level(display_level), .. self }
+ }
+ 
+ pub fn with_thread_names(self, display_thread_names: bool) -> SubscriberBuilder<N, format::Format<L, T>, F, W> {
+ SubscriberBuilder { inner: self.inner.with_thread_names(display_thread_names), .. self }
+ }
+ 
+ pub fn with_thread_ids(self, display_thread_ids: bool) -> SubscriberBuilder<N, format::Format<L, T>, F, W> {
+ SubscriberBuilder { inner: self.inner.with_thread_ids(display_thread_ids), .. self }
+ }
+ 
+ pub fn compact(self) -> SubscriberBuilder<N, format::Format<format::Compact, T>, F, W> {
+ SubscriberBuilder { filter: self.filter, inner: self.inner.compact() }
+ }
+ 
+ pub fn pretty(self) -> SubscriberBuilder<format::Pretty, format::Format<format::Pretty, T>, F, W> {
+ SubscriberBuilder { filter: self.filter, inner: self.inner.pretty() }
+ }
+ 
+ pub fn json(self) -> SubscriberBuilder<format::JsonFields, format::Format<format::Json, T>, F, W> {
+ SubscriberBuilder { filter: self.filter, inner: self.inner.json() }
+ }
+ 
+}
+
+#[cfg(feature = "json")]
+#[cfg_attr(docsrs, doc(cfg(feature = "json")))]
+impl<T, F, W> SubscriberBuilder<format::JsonFields, format::Format<format::Json, T>, F, W> {
+ pub fn flatten_event(self, flatten_event: bool) -> SubscriberBuilder<format::JsonFields, format::Format<format::Json, T>, F, W> {
+ SubscriberBuilder { filter: self.filter, inner: self.inner.flatten_event(flatten_event) }
+ }
+ 
+ pub fn with_current_span(self, display_current_span: bool) -> SubscriberBuilder<format::JsonFields, format::Format<format::Json, T>, F, W> {
+ SubscriberBuilder { filter: self.filter, inner: self.inner.with_current_span(display_current_span) }
+ }
+ 
+ pub fn with_span_list(self, display_span_list: bool) -> SubscriberBuilder<format::JsonFields, format::Format<format::Json, T>, F, W> {
+ SubscriberBuilder { filter: self.filter, inner: self.inner.with_span_list(display_span_list) }
+ }
+ 
+}
+
+#[cfg(feature = "env-filter")]
+#[cfg_attr(docsrs, doc(cfg(feature = "env-filter")))]
+impl<N, E, W> SubscriberBuilder<N, E, crate::EnvFilter, W> where Formatter<N, E, W>: tracing_core::Subscriber + static {
+ pub fn with_filter_reloading(self) -> SubscriberBuilder<N, E, crate::reload::Layer<crate::EnvFilter, Formatter<N, E, W>>, W> {
+ let _ = crate::reload::Layer::new(self.filter);
+ SubscriberBuilder { filter, inner: self.inner }
+ }
+ 
+}
+
+#[cfg(feature = "env-filter")]
+#[cfg_attr(docsrs, doc(cfg(feature = "env-filter")))]
+impl<N, E, W> SubscriberBuilder<N, E, crate::reload::Layer<crate::EnvFilter, Formatter<N, E, W>>, W> where Formatter<N, E, W>: tracing_core::Subscriber + static {
+ pub fn reload_handle(&self) -> crate::reload::Handle<crate::EnvFilter, Formatter<N, E, W>> {
+ self.filter.handle()
+ }
+ 
+}
+
+impl<N, E, F, W> SubscriberBuilder<N, E, F, W> {
+ pub fn fmt_fields(self, fmt_fields: N2) -> SubscriberBuilder<N2, E, F, W> {
+ SubscriberBuilder { filter: self.filter, inner: self.inner.fmt_fields(fmt_fields) }
+ }
+ 
+ pub fn with_env_filter(self, filter: impl Into<crate::EnvFilter>) -> SubscriberBuilder<N, E, crate::EnvFilter, W> {
+ let filter = filter.into();
+ SubscriberBuilder { filter, inner: self.inner }
+ }
+ 
+ pub fn with_max_level(self, filter: impl Into<LevelFilter>) -> SubscriberBuilder<N, E, LevelFilter, W> {
+ let filter = filter.into();
+ SubscriberBuilder { filter, inner: self.inner }
+ }
+ 
+ pub fn event_format(self, fmt_event: E2) -> SubscriberBuilder<N, E2, F, W> {
+ SubscriberBuilder { filter: self.filter, inner: self.inner.event_format(fmt_event) }
+ }
+ 
+ pub fn with_writer(self, make_writer: W2) -> SubscriberBuilder<N, E, F, W2> {
+ SubscriberBuilder { filter: self.filter, inner: self.inner.with_writer(make_writer) }
+ }
+ 
+ pub fn with_test_writer(self) -> SubscriberBuilder<N, E, F, TestWriter> {
+ SubscriberBuilder { filter: self.filter, inner: self.inner.with_writer(TestWriter::default()) }
+ }
+ 
+ pub fn map_event_format(self, f: impl FnOnce) -> SubscriberBuilder<N, E2, F, W> {
+ SubscriberBuilder { filter: self.filter, inner: self.inner.map_event_format(f) }
+ }
+ 
+ pub fn map_fmt_fields(self, f: impl FnOnce) -> SubscriberBuilder<N2, E, F, W> {
+ SubscriberBuilder { filter: self.filter, inner: self.inner.map_fmt_fields(f) }
+ }
+ 
+ pub fn map_writer(self, f: impl FnOnce) -> SubscriberBuilder<N, E, F, W2> {
+ SubscriberBuilder { filter: self.filter, inner: self.inner.map_writer(f) }
+ }
+ 
+}
+
+/// Install a global tracing subscriber that listens for events and
+/// filters based on the value of the [`RUST_LOG` environment variable],
+/// if one is not already set.
+/// 
+/// If the `tracing-log` feature is enabled, this will also install
+/// the [`LogTracer`] to convert `log` records into `tracing` `Event`s.
+/// 
+/// This is shorthand for
+/// 
+/// ```rust
+/// # fn doc() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+/// tracing_subscriber::fmt().try_init()
+/// # }
+/// ```
+/// 
+/// 
+/// # Errors
+/// 
+/// Returns an Error if the initialization was unsuccessful,
+/// likely because a global subscriber was already installed by another
+/// call to `try_init`.
+/// 
+/// [`LogTracer`]:
+/// https://docs.rs/tracing-log/0.1.0/tracing_log/struct.LogTracer.html
+/// [`RUST_LOG` environment variable]: crate::filter::EnvFilter::DEFAULT_ENV
+pub fn try_init() -> Result<(), Box<_>> {
+ let builder = Subscriber::builder();
+ let builder = builder.with_env_filter(crate::EnvFilter::from_default_env());
+ let builder = builder.with_max_level(LevelFilter::TRACE);
+ let subscriber = builder.finish();
+ let subscriber = { use crate::{ filter::Targets, layer::SubscriberExt }; use std::{ env, eprintln, str::FromStr }; let targets = match env::var("RUST_LOG") { Ok(var) => Targets::from_str(&var).map_err(| e | { eprintln!("Ignoring `RUST_LOG={:?}`: {}", var, e); }).unwrap_or_default(), Err(env::VarError::NotPresent) => { Targets::new().with_default(Subscriber::DEFAULT_MAX_LEVEL) } Err(e) => { eprintln!("Ignoring `RUST_LOG`: {}", e); Targets::new().with_default(Subscriber::DEFAULT_MAX_LEVEL) } }; subscriber.with(targets) };
+ subscriber.try_init().map_err(Into::into)
+}
+
+/// Install a global tracing subscriber that listens for events and
+/// filters based on the value of the [`RUST_LOG` environment variable].
+/// 
+/// The configuration of the subscriber initialized by this function
+/// depends on what [feature flags](crate#feature-flags) are enabled.
+/// 
+/// If the `tracing-log` feature is enabled, this will also install
+/// the LogTracer to convert `Log` records into `tracing` `Event`s.
+/// 
+/// If the `env-filter` feature is enabled, this is shorthand for
+/// 
+/// ```rust
+/// # use tracing_subscriber::EnvFilter;
+/// tracing_subscriber::fmt()
+/// .with_env_filter(EnvFilter::from_default_env())
+/// .init();
+/// ```
+/// 
+/// # Panics
+/// Panics if the initialization was unsuccessful, likely because a
+/// global subscriber was already installed by another call to `try_init`.
+/// 
+/// [`RUST_LOG` environment variable]: crate::filter::EnvFilter::DEFAULT_ENV
+pub fn init() {
+ try_init().expect("Unable to install global subscriber")
+}
+
+#[cfg(test)]
+mod test {
+ use crate::{ filter::LevelFilter, fmt::{ format::{ self, Format }, time, writer::MakeWriter, Subscriber } };
+ use alloc::{ borrow::ToOwned, string::String, vec::Vec };
+ use std::{ io, sync::{ Arc, Mutex, MutexGuard, TryLockError } };
+ use tracing_core::dispatcher::Dispatch;
+ struct MockWriter {
+ buf: Arc<Mutex<Vec<u8>>>,
+ }
+ 
+ impl MockWriter {
+ fn new(buf: Arc<Mutex<Vec<u8>>>) -> Self {
+ Self { buf }
+ }
+ 
+ fn map_error(err: TryLockError<Guard>) -> io::Error {
+ match err { TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock), TryLockError::Poisoned(_) => io::Error::from(io::ErrorKind::Other) }
+ }
+ 
+ fn buf(&self) -> io::Result<MutexGuard<'_, Vec<u8>>> {
+ self.buf.try_lock().map_err(Self::map_error)
+ }
+ 
+ }
+ 
+ impl io::Write for MockWriter {
+ fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+ self.buf() ? . write(buf)
+ }
+ 
+ fn flush(&mut self) -> io::Result<()> {
+ self.buf() ? . flush()
+ }
+ 
+ }
+ 
+ #[derive(Clone, Default)]
+ struct MockMakeWriter {
+ buf: Arc<Mutex<Vec<u8>>>,
+ }
+ 
+ impl MockMakeWriter {
+ fn new(buf: Arc<Mutex<Vec<u8>>>) -> Self {
+ Self { buf }
+ }
+ 
+ fn buf(&self) -> MutexGuard<'_, Vec<u8>> {
+ self.buf.lock().unwrap()
+ }
+ 
+ fn get_string(&self) -> String {
+ let mut buf = self.buf.lock().expect("lock shouldn't be poisoned");
+ let string = std::str::from_utf8(&buf [..]).expect("formatter should not have produced invalid utf-8").to_owned();
+ buf.clear();
+ string
+ }
+ 
+ }
+ 
+ impl<a> MakeWriter<a> for MockMakeWriter {
+ type Writer = MockWriter;
+ fn make_writer(&self) -> Self::Writer {
+ MockWriter::new(self.buf.clone())
+ }
+ 
+ }
+ 
+ #[test]
+ fn impls() {
+ let f = Format::default().with_timer(time::Uptime::default());
+ let subscriber = Subscriber::builder().event_format(f).finish();
+ let _dispatch = Dispatch::new(subscriber);
+ let f = format::Format::default();
+ let subscriber = Subscriber::builder().event_format(f).finish();
+ let _dispatch = Dispatch::new(subscriber);
+ let f = format::Format::default().compact();
+ let subscriber = Subscriber::builder().event_format(f).finish();
+ let _dispatch = Dispatch::new(subscriber);
+ }
+ 
+ #[test]
+ fn subscriber_downcasts() {
+ let subscriber = Subscriber::builder().finish();
+ let dispatch = Dispatch::new(subscriber);
+ assert!(dispatch.downcast_ref::<Subscriber>().is_some());
+ }
+ 
+ #[test]
+ fn subscriber_downcasts_to_parts() {
+ let subscriber = Subscriber::new();
+ let dispatch = Dispatch::new(subscriber);
+ assert!(dispatch.downcast_ref::<format::DefaultFields>().is_some());
+ assert!(dispatch.downcast_ref::<LevelFilter>().is_some());
+ assert!(dispatch.downcast_ref::<format::Format>().is_some())
+ }
+ 
+ #[test]
+ fn is_lookup_span() {
+ fn assert_lookup_span<T: crate::registry::LookupSpan<a>>(_: T) {
+ }
+ 
+ let subscriber = Subscriber::new();
+ assert_lookup_span(subscriber)
+ }
+ 
+}
+

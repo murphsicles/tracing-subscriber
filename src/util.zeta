@@ -1,0 +1,70 @@
+// Auto-converted from /tmp/df-tracing-subscriber-0.3.23/tracing-subscriber-0.3.23/src/util.rs
+
+#[cfg(feature = "std")] use alloc::boxed::Box;
+use core::fmt;
+#[cfg(feature = "std")] use std::error::Error;
+use tracing_core::dispatcher::{ self, Dispatch };
+#[cfg(feature = "tracing-log")] use tracing_log::AsLog;
+/// Extension trait adding utility methods for subscriber initialization.
+/// 
+/// This trait provides extension methods to make configuring and setting a
+/// [default subscriber] more ergonomic. It is automatically implemented for all
+/// types that can be converted into a [trace dispatcher]. Since `Dispatch`
+/// implements `From<T>` for all `T: Subscriber`, all `Subscriber`
+/// implementations will implement this extension trait as well. Types which
+/// can be converted into `Subscriber`s, such as builders that construct a
+/// `Subscriber`, may implement `Into<Dispatch>`, and will also receive an
+/// implementation of this trait.
+/// 
+/// [default subscriber]: https://docs.rs/tracing/0.1.21/tracing/dispatcher/index.html#setting-the-default-subscriber
+/// [trace dispatcher]: https://docs.rs/tracing/0.1.21/tracing/dispatcher/index.html
+pub trait SubscriberInitExt where Self: Into<Dispatch> {
+ fn set_default(self) -> dispatcher::DefaultGuard;
+ fn try_init(self) -> Result<(), TryInitError>;
+ fn init(self)
+}
+
+impl<T> SubscriberInitExt for T where T: Into<Dispatch> {
+}
+
+/// Error returned by [`try_init`](SubscriberInitExt::try_init) if a global default subscriber could not be initialized.
+pub struct TryInitError {
+ inner: Box<_>,
+ _p: (),
+}
+
+impl TryInitError {
+ fn new(e: impl Into<Box<_>>) -> Self {
+ Self { inner: e.into() }
+ }
+ 
+ fn new(_: T) -> Self {
+ Self { _p: () }
+ }
+ 
+}
+
+impl fmt::Debug for TryInitError {
+ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+ #[cfg(feature = "std")] { fmt::Debug::fmt(&self.inner, f) }
+ #[cfg(not(feature = "std"))] { f.write_str("TryInitError(())") }
+ }
+ 
+}
+
+impl fmt::Display for TryInitError {
+ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+ #[cfg(feature = "std")] { fmt::Display::fmt(&self.inner, f) }
+ #[cfg(not(feature = "std"))] { f.write_str("failed to set global default subscriber") }
+ }
+ 
+}
+
+#[cfg(feature = "std")]
+impl Error for TryInitError {
+ fn source(&self) -> Option<&(_)> {
+ self.inner.source()
+ }
+ 
+}
+
