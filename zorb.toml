@@ -1,0 +1,12 @@
+[package]
+name = "@log/tracing-subscriber"
+version = "0.1.0"
+edition = "2026"
+description = "Structured tracing subscriber for Zeta — FmtSubscriber, EnvFilter, Registry, composable Layer system"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/murphsicles/tracing-subscriber"
+keywords = ["tracing", "logging", "observability", "structured-logging"]
+categories = ["observability"]
+
+[dependencies]
+@log/tracing = ">=0.1.0"
