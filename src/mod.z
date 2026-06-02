@@ -1,0 +1,1770 @@
+// @log/tracing-subscriber v0.1.0
+//
+// Bundled sub-crates: tracing-subscriber, matchers, nu-ansi-term,
+// sharded-slab, thread_local, tracing-log, tracing-serde.
+//
+// Use: `import @log/tracing-subscriber`
+//
+// No proc-macros, no lifetimes. Pure Zeta.
+
+// ============================================================================
+// re-exports
+// ============================================================================
+
+pub use @log/tracing::{Span, Event, Subscriber, Level, Metadata, Field, Id, Value};
+
+// ============================================================================
+// sharded-slab — concurrent slab for span data
+// ============================================================================
+
+const SHARD_COUNT: u64 = 64;
+const SLOT_COUNT: u64 = 512;
+
+struct Slot {
+    next_free: u64,
+    generation: u64,
+    occupied: bool,
+}
+
+pub struct ShardedSlab {
+    shards: [Shard; 64],
+    next_id: u64,
+    lock: AtomicLock,
+}
+
+struct Shard {
+    slots: [Slot; 512],
+    free_head: u64,
+    count: u64,
+}
+
+struct AtomicLock {
+    locked: bool,
+}
+
+impl AtomicLock {
+    fn new() -> AtomicLock {
+        return AtomicLock { locked: false };
+    }
+
+    fn acquire(&mut self) {
+        while self.locked {
+            // spin
+        }
+        self.locked = true;
+    }
+
+    fn release(&mut self) {
+        self.locked = false;
+    }
+}
+
+impl Shard {
+    fn new() -> Shard {
+        let mut slots: [Slot; 512];
+        let mut i: u64 = 0;
+        while i < 512 {
+            slots[i] = Slot {
+                next_free: i + 1,
+                generation: 0,
+                occupied: false,
+            };
+            i = i + 1;
+        }
+        slots[511].next_free = 0; // sentinel
+        return Shard {
+            slots: slots,
+            free_head: 0,
+            count: 0,
+        };
+    }
+
+    fn alloc(&mut self) -> u64 {
+        let head = self.free_head;
+        if head == 0 {
+            return 0; // full
+        }
+        let idx = head - 1;
+        let slot = self.slots[idx];
+        self.free_head = slot.next_free;
+        self.slots[idx].occupied = true;
+        self.slots[idx].generation = slot.generation + 1;
+        self.count = self.count + 1;
+        // pack id: (idx + 1) | (generation << 24)
+        return idx + 1 | (slot.generation + 1) << 24;
+    }
+
+    fn free(&mut self, id: u64) {
+        let idx = (id & 0xFFFFFF) - 1;
+        if idx >= 512 {
+            return;
+        }
+        if !self.slots[idx].occupied {
+            return;
+        }
+        self.slots[idx].occupied = false;
+        self.slots[idx].next_free = self.free_head;
+        self.free_head = idx + 1;
+        self.count = self.count - 1;
+    }
+
+    fn is_occupied(&self, id: u64) -> bool {
+        let idx = (id & 0xFFFFFF) - 1;
+        if idx >= 512 {
+            return false;
+        }
+        return self.slots[idx].occupied;
+    }
+}
+
+impl ShardedSlab {
+    pub fn new() -> ShardedSlab {
+        let mut shards: [Shard; 64];
+        let mut i: u64 = 0;
+        while i < 64 {
+            shards[i] = Shard::new();
+            i = i + 1;
+        }
+        return ShardedSlab {
+            shards: shards,
+            next_id: 1,
+            lock: AtomicLock::new(),
+        };
+    }
+
+    pub fn insert(&mut self, value: SpanData) -> u64 {
+        self.lock.acquire();
+        let shard_idx = self.next_id % 64;
+        let shard = self.shards[shard_idx];
+        let id = shard.alloc();
+        if id == 0 {
+            self.lock.release();
+            return 0;
+        }
+        self.next_id = self.next_id + 1;
+        self.lock.release();
+        return id;
+    }
+
+    pub fn remove(&mut self, id: u64) {
+        self.lock.acquire();
+        let shard_idx = id % 64;
+        let shard = self.shards[shard_idx];
+        shard.free(id);
+        self.lock.release();
+    }
+
+    pub fn contains(&self, id: u64) -> bool {
+        let shard_idx = id % 64;
+        let shard = self.shards[shard_idx];
+        return shard.is_occupied(id);
+    }
+}
+
+// ============================================================================
+// thread_local — simplified TLS wrapper
+// ============================================================================
+
+pub struct ThreadLocal {
+    data: Map,
+}
+
+struct Map {
+    keys: [u64; 128],
+    values: [u64; 128],
+    count: u64,
+}
+
+impl Map {
+    fn new() -> Map {
+        return Map {
+            keys: [0; 128],
+            values: [0; 128],
+            count: 0,
+        };
+    }
+
+    fn set(&mut self, key: u64, val: u64) {
+        let mut i: u64 = 0;
+        while i < self.count {
+            if self.keys[i] == key {
+                self.values[i] = val;
+                return;
+            }
+            i = i + 1;
+        }
+        if self.count < 128 {
+            self.keys[self.count] = key;
+            self.values[self.count] = val;
+            self.count = self.count + 1;
+        }
+    }
+
+    fn get(&self, key: u64) -> u64 {
+        let mut i: u64 = 0;
+        while i < self.count {
+            if self.keys[i] == key {
+                return self.values[i];
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+}
+
+pub struct ThreadLocalStorage {
+    // simplified: single writer per thread
+    storage: [ThreadLocalCell; 256],
+}
+
+struct ThreadLocalCell {
+    tid: u64,
+    value: u64,
+}
+
+impl ThreadLocalStorage {
+    pub fn new() -> ThreadLocalStorage {
+        return ThreadLocalStorage {
+            storage: [ThreadLocalCell { tid: 0, value: 0 }; 256],
+        };
+    }
+
+    pub fn get(&self, tid: u64) -> u64 {
+        let mut i: u64 = 0;
+        while i < 256 {
+            if self.storage[i].tid == tid {
+                return self.storage[i].value;
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    pub fn set(&mut self, tid: u64, val: u64) {
+        let mut i: u64 = 0;
+        while i < 256 {
+            if self.storage[i].tid == tid {
+                self.storage[i].value = val;
+                return;
+            }
+            if self.storage[i].tid == 0 {
+                self.storage[i].tid = tid;
+                self.storage[i].value = val;
+                return;
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// ============================================================================
+// nu-ansi-term — ANSI terminal styling
+// ============================================================================
+
+pub enum Style {
+    Default,
+    Bold,
+    Dim,
+    Italic,
+    Underline,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+    BrightRed,
+    BrightGreen,
+    BrightYellow,
+    BrightBlue,
+    BrightMagenta,
+    BrightCyan,
+    BrightWhite,
+    OnRed,
+    OnGreen,
+    OnYellow,
+    OnBlue,
+    OnMagenta,
+    OnCyan,
+    OnWhite,
+}
+
+pub fn ansi_style(style: Style) -> String {
+    return match style {
+        Style::Bold => "\x1b[1m",
+        Style::Dim => "\x1b[2m",
+        Style::Italic => "\x1b[3m",
+        Style::Underline => "\x1b[4m",
+        Style::Red => "\x1b[31m",
+        Style::Green => "\x1b[32m",
+        Style::Yellow => "\x1b[33m",
+        Style::Blue => "\x1b[34m",
+        Style::Magenta => "\x1b[35m",
+        Style::Cyan => "\x1b[36m",
+        Style::White => "\x1b[37m",
+        Style::BrightRed => "\x1b[91m",
+        Style::BrightGreen => "\x1b[92m",
+        Style::BrightYellow => "\x1b[93m",
+        Style::BrightBlue => "\x1b[94m",
+        Style::BrightMagenta => "\x1b[95m",
+        Style::BrightCyan => "\x1b[96m",
+        Style::BrightWhite => "\x1b[97m",
+        Style::OnRed => "\x1b[41m",
+        Style::OnGreen => "\x1b[42m",
+        Style::OnYellow => "\x1b[43m",
+        Style::OnBlue => "\x1b[44m",
+        Style::OnMagenta => "\x1b[45m",
+        Style::OnCyan => "\x1b[46m",
+        Style::OnWhite => "\x1b[47m",
+        _ => "",
+    };
+}
+
+pub fn ansi_reset() -> String {
+    return "\x1b[0m";
+}
+
+pub fn style_text(text: String, style: Style) -> String {
+    return ansi_style(style) + text + ansi_reset();
+}
+
+// ============================================================================
+// matchers — pattern matching for filter directives
+// ============================================================================
+
+pub struct Matcher {
+    pattern: String,
+    exact: bool,
+    case_sensitive: bool,
+}
+
+impl Matcher {
+    pub fn new(pattern: String) -> Matcher {
+        let exact = false;
+        let case_sensitive = true;
+        return Matcher { pattern: pattern, exact: exact, case_sensitive: case_sensitive };
+    }
+
+    pub fn new_exact(pattern: String) -> Matcher {
+        return Matcher { pattern: pattern, exact: true, case_sensitive: true };
+    }
+
+    pub fn matches(&self, value: String) -> bool {
+        if self.exact {
+            if self.case_sensitive {
+                return value == self.pattern;
+            } else {
+                return value.to_lowercase() == self.pattern.to_lowercase();
+            }
+        } else {
+            if self.case_sensitive {
+                return value.contains(self.pattern);
+            } else {
+                return value.to_lowercase().contains(self.pattern.to_lowercase());
+            }
+        }
+    }
+}
+
+pub struct FieldMatcher {
+    name: String,
+    pattern: Matcher,
+}
+
+impl FieldMatcher {
+    pub fn new(name: String, pattern: String) -> FieldMatcher {
+        return FieldMatcher { name: name, pattern: Matcher::new(pattern) };
+    }
+
+    pub fn matches(&self, field_name: String, field_value: String) -> bool {
+        if !self.name_matches(field_name) {
+            return false;
+        }
+        return self.pattern.matches(field_value);
+    }
+
+    fn name_matches(&self, name: String) -> bool {
+        return name == self.name;
+    }
+}
+
+// ============================================================================
+// EnvFilter — RUST_LOG style directive parsing & filtering
+// ============================================================================
+
+pub struct EnvFilter {
+    directives: Vec<Directive>,
+    default_level: LevelFilter,
+}
+
+pub enum LevelFilter {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+struct Directive {
+    module: String,
+    level: LevelFilter,
+    field_matchers: Vec<FieldMatcher>,
+    is_global: bool,
+}
+
+fn level_filter_from_str(s: String) -> LevelFilter {
+    let lower = s.to_lowercase();
+    if lower == "off" { return LevelFilter::Off; }
+    if lower == "error" { return LevelFilter::Error; }
+    if lower == "warn" { return LevelFilter::Warn; }
+    if lower == "info" { return LevelFilter::Info; }
+    if lower == "debug" { return LevelFilter::Debug; }
+    if lower == "trace" { return LevelFilter::Trace; }
+    return LevelFilter::Info; // default
+}
+
+fn level_to_filter(level: Level) -> LevelFilter {
+    // Match against tracing Level values
+    if level == Level::Trace { return LevelFilter::Trace; }
+    if level == Level::Debug { return LevelFilter::Debug; }
+    if level == Level::Info { return LevelFilter::Info; }
+    if level == Level::Warn { return LevelFilter::Warn; }
+    if level == Level::Error { return LevelFilter::Error; }
+    return LevelFilter::Info;
+}
+
+impl LevelFilter {
+    fn allows(&self, level: LevelFilter) -> bool {
+        let self_val: u64 = match self {
+            LevelFilter::Off => 0,
+            LevelFilter::Error => 1,
+            LevelFilter::Warn => 2,
+            LevelFilter::Info => 3,
+            LevelFilter::Debug => 4,
+            LevelFilter::Trace => 5,
+        };
+        let level_val: u64 = match level {
+            LevelFilter::Off => 0,
+            LevelFilter::Error => 1,
+            LevelFilter::Warn => 2,
+            LevelFilter::Info => 3,
+            LevelFilter::Debug => 4,
+            LevelFilter::Trace => 5,
+        };
+        return level_val <= self_val;
+    }
+}
+
+impl EnvFilter {
+    pub fn new() -> EnvFilter {
+        return EnvFilter {
+            directives: Vec::new(),
+            default_level: LevelFilter::Info,
+        };
+    }
+
+    pub fn from_env() -> EnvFilter {
+        let val = env("RUST_LOG");
+        if val == "" {
+            return EnvFilter::new();
+        }
+        return EnvFilter::parse(val);
+    }
+
+    pub fn parse(directive_str: String) -> EnvFilter {
+        let mut filter = EnvFilter::new();
+        let parts: Vec<String> = directive_str.split(",");
+        let mut i: u64 = 0;
+        while i < parts.len() {
+            let part = parts[i].trim();
+            if part == "" {
+                i = i + 1;
+                continue;
+            }
+            if part.contains("=") {
+                let kv: Vec<String> = part.split("=");
+                if kv.len() == 2 {
+                    let module = kv[0].trim();
+                    let level_str = kv[1].trim();
+                    let level = level_filter_from_str(level_str);
+                    filter.directives.push(Directive {
+                        module: module,
+                        level: level,
+                        field_matchers: Vec::new(),
+                        is_global: false,
+                    });
+                }
+            } else {
+                let level = level_filter_from_str(part);
+                filter.default_level = level;
+            }
+            i = i + 1;
+        }
+        return filter;
+    }
+
+    pub fn with_directive(mut self, module: String, level: String) -> EnvFilter {
+        let level_filter = level_filter_from_str(level);
+        self.directives.push(Directive {
+            module: module,
+            level: level_filter,
+            field_matchers: Vec::new(),
+            is_global: false,
+        });
+        return self;
+    }
+
+    pub fn with_default_level(mut self, level: LevelFilter) -> EnvFilter {
+        self.default_level = level;
+        return self;
+    }
+
+    pub fn enabled(&self, module: String, level: Level) -> bool {
+        let level_filter = level_to_filter(level);
+        // check module-specific directives first
+        let mut i: u64 = 0;
+        while i < self.directives.len() {
+            let dir = self.directives[i];
+            if module.contains(dir.module) {
+                return dir.level.allows(level_filter);
+            }
+            i = i + 1;
+        }
+        return self.default_level.allows(level_filter);
+    }
+
+    pub fn enabled_for(&self, metadata: Metadata) -> bool {
+        let module = metadata.target();
+        let level = metadata.level();
+        return self.enabled(module, level);
+    }
+
+    pub fn add_directive(&mut self, module: String, level_str: String) {
+        let level = level_filter_from_str(level_str);
+        self.directives.push(Directive {
+            module: module,
+            level: level,
+            field_matchers: Vec::new(),
+            is_global: false,
+        });
+    }
+
+    pub fn set_default_level(&mut self, level_str: String) {
+        self.default_level = level_filter_from_str(level_str);
+    }
+}
+
+// ============================================================================
+// LookupSpan — trait for retrieving span data from a registry
+// ============================================================================
+
+pub trait LookupSpan {
+    fn span_data(&self, id: Id) -> SpanData;
+    fn span_exists(&self, id: Id) -> bool;
+    fn current_span_id(&self) -> Id;
+    fn record_span(&mut self, id: Id, field: Field, value: Value);
+    fn record_follows_from(&mut self, id: Id, follows: Id);
+}
+
+// ============================================================================
+// SpanData — stored per-span information
+// ============================================================================
+
+pub struct SpanData {
+    pub id: Id,
+    pub parent_id: Id,
+    pub metadata: Metadata,
+    pub fields: Vec<(String, String)>, // simplified key-value
+    pub ref_count: u64,
+    pub is_closed: bool,
+    pub follows_from: Vec<Id>,
+}
+
+impl SpanData {
+    pub fn new(id: Id, parent_id: Id, metadata: Metadata) -> SpanData {
+        return SpanData {
+            id: id,
+            parent_id: parent_id,
+            metadata: metadata,
+            fields: Vec::new(),
+            ref_count: 1,
+            is_closed: false,
+            follows_from: Vec::new(),
+        };
+    }
+
+    pub fn name(&self) -> String {
+        return self.metadata.name();
+    }
+
+    pub fn target(&self) -> String {
+        return self.metadata.target();
+    }
+
+    pub fn level(&self) -> Level {
+        return self.metadata.level();
+    }
+}
+
+// ============================================================================
+// Layer — trait for composing multiple subscribers
+// ============================================================================
+
+pub trait Layer {
+    fn on_new_span(&mut self, span: SpanData);
+    fn on_record(&mut self, span_id: Id, field: Field, value: Value);
+    fn on_enter(&mut self, span_id: Id);
+    fn on_exit(&mut self, span_id: Id);
+    fn on_close(&mut self, span_id: Id);
+    fn on_event(&mut self, event: Event);
+    fn on_event_enabled(&mut self, metadata: Metadata) -> bool;
+    fn enabled(&mut self, metadata: Metadata) -> bool;
+}
+
+// ============================================================================
+// Identity — no-op layer passthrough
+// ============================================================================
+
+pub struct Identity;
+
+impl Identity {
+    pub fn new() -> Identity {
+        return Identity;
+    }
+}
+
+impl Layer for Identity {
+    fn on_new_span(&mut self, span: SpanData) {
+        // passthrough
+    }
+    fn on_record(&mut self, span_id: Id, field: Field, value: Value) {
+        // passthrough
+    }
+    fn on_enter(&mut self, span_id: Id) {
+        // passthrough
+    }
+    fn on_exit(&mut self, span_id: Id) {
+        // passthrough
+    }
+    fn on_close(&mut self, span_id: Id) {
+        // passthrough
+    }
+    fn on_event(&mut self, event: Event) {
+        // passthrough
+    }
+    fn on_event_enabled(&mut self, metadata: Metadata) -> bool {
+        return true;
+    }
+    fn enabled(&mut self, metadata: Metadata) -> bool {
+        return true;
+    }
+}
+
+// ============================================================================
+// Stack — layer composition type
+// ============================================================================
+
+pub struct Stack {
+    layers: Vec<StackLayer>,
+}
+
+struct StackLayer {
+    inner: LayerRef,
+}
+
+// Simplified: use an index into a pool or pass-through
+// For Zeta, we'll use a single subscriber approach
+pub struct LayerRef {
+    id: u64,
+}
+
+impl Stack {
+    pub fn new() -> Stack {
+        return Stack { layers: Vec::new() };
+    }
+
+    pub fn push(&mut self, layer: LayerRef) {
+        self.layers.push(StackLayer { inner: layer });
+    }
+
+    pub fn len(&self) -> u64 {
+        return self.layers.len();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        return self.layers.len() == 0;
+    }
+}
+
+// ============================================================================
+// MakeWriter — trait for output writers
+// ============================================================================
+
+pub trait MakeWriter {
+    fn make_writer(&self) -> FmtWriter;
+}
+
+// ============================================================================
+// FmtWriter — output to stdout / stderr / custom
+// ============================================================================
+
+pub enum FmtWriter {
+    Stdout,
+    Stderr,
+    Custom { buffer: String },
+}
+
+impl FmtWriter {
+    pub fn stdout() -> FmtWriter {
+        return FmtWriter::Stdout;
+    }
+
+    pub fn stderr() -> FmtWriter {
+        return FmtWriter::Stderr;
+    }
+
+    pub fn write(&mut self, s: String) {
+        match self {
+            FmtWriter::Stdout => print(s),
+            FmtWriter::Stderr => eprint(s),
+            FmtWriter::Custom { buffer } => {
+                buffer.push_str(s);
+            },
+        }
+    }
+
+    pub fn writeln(&mut self, s: String) {
+        self.write(s + "\n");
+    }
+}
+
+impl MakeWriter for FmtWriter {
+    fn make_writer(&self) -> FmtWriter {
+        return match self {
+            FmtWriter::Stdout => FmtWriter::Stdout,
+            FmtWriter::Stderr => FmtWriter::Stderr,
+            FmtWriter::Custom { buffer } => FmtWriter::Custom { buffer: buffer.clone() },
+        };
+    }
+}
+
+// ============================================================================
+// TextFormatter — plain text formatting
+// ============================================================================
+
+pub struct TextFormatter {
+    ansi: bool,
+    display_target: bool,
+    display_level: bool,
+    display_line_number: bool,
+    display_thread_id: bool,
+    display_thread_name: bool,
+}
+
+impl TextFormatter {
+    pub fn new() -> TextFormatter {
+        return TextFormatter {
+            ansi: true,
+            display_target: true,
+            display_level: true,
+            display_line_number: false,
+            display_thread_id: false,
+            display_thread_name: false,
+        };
+    }
+
+    pub fn format_event(&self, event: Event, writer: &mut FmtWriter) {
+        let metadata = event.metadata();
+        let level = metadata.level();
+        let target = metadata.target();
+
+        let mut line = String::new();
+
+        // timestamp
+        let ts = std_time();
+        line = line + ts;
+
+        // level
+        if self.display_level {
+            line = line + " ";
+            if self.ansi {
+                let level_style = match level {
+                    Level::Error => Style::Red,
+                    Level::Warn => Style::Yellow,
+                    Level::Info => Style::Green,
+                    Level::Debug => Style::Blue,
+                    Level::Trace => Style::BrightWhite,
+                    _ => Style::Default,
+                };
+                line = line + ansi_style(level_style);
+                line = line + level.to_string();
+                line = line + ansi_reset();
+            } else {
+                line = line + level.to_string();
+            }
+        }
+
+        // target
+        if self.display_target {
+            line = line + " ";
+            if self.ansi {
+                line = line + ansi_style(Style::Dim);
+            }
+            line = line + target;
+            if self.ansi {
+                line = line + ansi_reset();
+            }
+        }
+
+        // message
+        line = line + ": ";
+        let message = event.message();
+        if self.ansi {
+            line = line + ansi_style(Style::Bold);
+        }
+        line = line + message;
+        if self.ansi {
+            line = line + ansi_reset();
+        }
+
+        writer.writeln(line);
+    }
+
+    pub fn format_json(&self, event: Event, writer: &mut FmtWriter) {
+        let metadata = event.metadata();
+        let level = metadata.level();
+        let target = metadata.target();
+        let message = event.message();
+
+        let json = json_format(event);
+        writer.writeln(json);
+    }
+}
+
+// ============================================================================
+// FmtSubscriber — the main subscriber users work with
+// ============================================================================
+
+pub struct FmtSubscriber {
+    builder: FmtSubscriberBuilder,
+    registry: Registry,
+    formatter: TextFormatter,
+    writer: FmtWriter,
+    filter: EnvFilter,
+    layers: Vec<LayerRef>,
+}
+
+pub struct FmtSubscriberBuilder {
+    with_target: bool,
+    with_level: bool,
+    with_line_number: bool,
+    with_thread_ids: bool,
+    with_thread_names: bool,
+    format: OutputFormat,
+    filter: EnvFilter,
+    max_level: LevelFilter,
+    writer: FmtWriter,
+    ansi: bool,
+}
+
+pub enum OutputFormat {
+    Full,
+    Compact,
+    Pretty,
+    Json,
+}
+
+impl FmtSubscriber {
+    pub fn builder() -> FmtSubscriberBuilder {
+        return FmtSubscriberBuilder {
+            with_target: true,
+            with_level: true,
+            with_line_number: false,
+            with_thread_ids: false,
+            with_thread_names: false,
+            format: OutputFormat::Full,
+            filter: EnvFilter::from_env(),
+            max_level: LevelFilter::Trace,
+            writer: FmtWriter::Stdout,
+            ansi: true,
+        };
+    }
+
+    pub fn new() -> FmtSubscriber {
+        return FmtSubscriber::builder().build();
+    }
+}
+
+impl FmtSubscriberBuilder {
+    pub fn with_target(mut self, val: bool) -> FmtSubscriberBuilder {
+        self.with_target = val;
+        return self;
+    }
+
+    pub fn with_level(mut self, val: bool) -> FmtSubscriberBuilder {
+        self.with_level = val;
+        return self;
+    }
+
+    pub fn with_line_number(mut self, val: bool) -> FmtSubscriberBuilder {
+        self.with_line_number = val;
+        return self;
+    }
+
+    pub fn with_thread_ids(mut self, val: bool) -> FmtSubscriberBuilder {
+        self.with_thread_ids = val;
+        return self;
+    }
+
+    pub fn with_thread_names(mut self, val: bool) -> FmtSubscriberBuilder {
+        self.with_thread_names = val;
+        return self;
+    }
+
+    pub fn json(mut self) -> FmtSubscriberBuilder {
+        self.format = OutputFormat::Json;
+        self.ansi = false;
+        return self;
+    }
+
+    pub fn compact(mut self) -> FmtSubscriberBuilder {
+        self.format = OutputFormat::Compact;
+        self.with_target = false;
+        return self;
+    }
+
+    pub fn pretty(mut self) -> FmtSubscriberBuilder {
+        self.format = OutputFormat::Pretty;
+        return self;
+    }
+
+    pub fn with_env_filter(mut self, filter: EnvFilter) -> FmtSubscriberBuilder {
+        self.filter = filter;
+        return self;
+    }
+
+    pub fn with_max_level(mut self, level: Level) -> FmtSubscriberBuilder {
+        self.max_level = level_to_filter(level);
+        return self;
+    }
+
+    pub fn with_ansi(mut self, val: bool) -> FmtSubscriberBuilder {
+        self.ansi = val;
+        return self;
+    }
+
+    pub fn with_writer(mut self, writer: FmtWriter) -> FmtSubscriberBuilder {
+        self.writer = writer;
+        return self;
+    }
+
+    pub fn init(mut self) {
+        let subscriber = self.build();
+        set_global_subscriber(subscriber);
+    }
+
+    pub fn build(self) -> FmtSubscriber {
+        let mut formatter = TextFormatter::new();
+        formatter.ansi = self.ansi;
+        formatter.display_target = self.with_target;
+        formatter.display_level = self.with_level;
+        formatter.display_line_number = self.with_line_number;
+        formatter.display_thread_id = self.with_thread_ids;
+        formatter.display_thread_name = self.with_thread_names;
+
+        return FmtSubscriber {
+            builder: self,
+            registry: Registry::new(),
+            formatter: formatter,
+            writer: self.writer,
+            filter: self.filter,
+            layers: Vec::new(),
+        };
+    }
+}
+
+impl FmtSubscriber {
+    pub fn with_layer(&mut self, layer: LayerRef) {
+        self.layers.push(layer);
+    }
+
+    fn should_enable(&self, metadata: Metadata) -> bool {
+        return self.filter.enabled_for(metadata);
+    }
+
+    fn format_and_write(&self, event: Event) {
+        let mut writer = match self.writer {
+            FmtWriter::Stdout => FmtWriter::Stdout,
+            FmtWriter::Stderr => FmtWriter::Stderr,
+            FmtWriter::Custom { buffer: _ } => FmtWriter::Custom { buffer: String::new() },
+        };
+
+        match self.builder.format {
+            OutputFormat::Json => self.formatter.format_json(event, &mut writer),
+            _ => self.formatter.format_event(event, &mut writer),
+        }
+    }
+}
+
+impl Subscriber for FmtSubscriber {
+    fn enter(&mut self, id: Id) {
+        // Dispatch to layers
+        let mut i: u64 = 0;
+        while i < self.layers.len() {
+            // layers would be called via registry
+            i = i + 1;
+        }
+        self.registry.enter(id);
+    }
+
+    fn exit(&mut self, id: Id) {
+        let mut i: u64 = 0;
+        while i < self.layers.len() {
+            i = i + 1;
+        }
+        self.registry.exit(id);
+    }
+
+    fn clone_span(&mut self, id: Id) -> Id {
+        return self.registry.clone_span(id);
+    }
+
+    fn try_close(&mut self, id: Id) -> bool {
+        return self.registry.try_close(id);
+    }
+
+    fn event_enabled(&mut self, event: Event) -> bool {
+        let metadata = event.metadata();
+        if !self.should_enable(metadata) {
+            return false;
+        }
+        let mut i: u64 = 0;
+        while i < self.layers.len() {
+            i = i + 1;
+        }
+        return true;
+    }
+
+    fn event(&mut self, event: Event) {
+        if !self.event_enabled(event) {
+            return;
+        }
+        // Format and write the event
+        self.format_and_write(event);
+
+        // Dispatch to layers
+        let mut i: u64 = 0;
+        while i < self.layers.len() {
+            i = i + 1;
+        }
+    }
+
+    fn new_span(&mut self, span: Span) {
+        let id = span.id();
+        let metadata = span.metadata();
+        let parent_id = Id::new(0); // root span
+
+        let data = SpanData::new(id, parent_id, metadata);
+        self.registry.new_span(data);
+
+        // Dispatch to layers
+        let mut i: u64 = 0;
+        while i < self.layers.len() {
+            i = i + 1;
+        }
+    }
+
+    fn record(&mut self, id: Id, field: Field, value: Value) {
+        self.registry.record(id, field, value);
+
+        let mut i: u64 = 0;
+        while i < self.layers.len() {
+            i = i + 1;
+        }
+    }
+
+    fn record_follows_from(&mut self, id: Id, follows: Id) {
+        self.registry.record_follows_from(id, follows);
+    }
+
+    fn enabled(&mut self, metadata: Metadata) -> bool {
+        return self.should_enable(metadata);
+    }
+}
+
+// ============================================================================
+// Registry — span tracking and layer dispatch
+// ============================================================================
+
+pub struct Registry {
+    spans: ShardedSlab,
+    span_data: Vec<SpanData>,
+    current_span_id: Id,
+    enter_count: u64,
+    visitor_count: u64,
+}
+
+impl Registry {
+    pub fn new() -> Registry {
+        return Registry {
+            spans: ShardedSlab::new(),
+            span_data: Vec::new(),
+            current_span_id: Id::new(0),
+            enter_count: 0,
+            visitor_count: 0,
+        };
+    }
+
+    pub fn enter(&mut self, id: Id) {
+        self.current_span_id = id;
+        self.enter_count = self.enter_count + 1;
+    }
+
+    pub fn exit(&mut self, id: Id) {
+        if self.enter_count > 0 {
+            self.enter_count = self.enter_count - 1;
+        }
+        if self.enter_count == 0 {
+            self.current_span_id = Id::new(0);
+        }
+    }
+
+    pub fn clone_span(&mut self, id: Id) -> Id {
+        // increment ref count
+        let mut i: u64 = 0;
+        while i < self.span_data.len() {
+            if self.span_data[i].id == id {
+                self.span_data[i].ref_count = self.span_data[i].ref_count + 1;
+                return id;
+            }
+            i = i + 1;
+        }
+        return id;
+    }
+
+    pub fn try_close(&mut self, id: Id) -> bool {
+        let mut i: u64 = 0;
+        while i < self.span_data.len() {
+            if self.span_data[i].id == id {
+                if self.span_data[i].ref_count > 0 {
+                    self.span_data[i].ref_count = self.span_data[i].ref_count - 1;
+                }
+                if self.span_data[i].ref_count == 0 {
+                    self.span_data[i].is_closed = true;
+                    return true;
+                }
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    pub fn new_span(&mut self, data: SpanData) {
+        let id_num: u64 = data.id.value();
+        self.spans.insert(id_num);
+        self.span_data.push(data);
+    }
+
+    pub fn record(&mut self, id: Id, field: Field, value: Value) {
+        let mut i: u64 = 0;
+        while i < self.span_data.len() {
+            if self.span_data[i].id == id {
+                self.span_data[i].fields.push((field.name(), value.to_string()));
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
+    pub fn record_follows_from(&mut self, id: Id, follows: Id) {
+        let mut i: u64 = 0;
+        while i < self.span_data.len() {
+            if self.span_data[i].id == id {
+                self.span_data[i].follows_from.push(follows);
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
+    pub fn visit(&mut self, id: Id) {
+        self.visitor_count = self.visitor_count + 1;
+    }
+
+    pub fn span_ref(&self, id: Id) -> SpanData {
+        let mut i: u64 = 0;
+        while i < self.span_data.len() {
+            if self.span_data[i].id == id {
+                return self.span_data[i];
+            }
+            i = i + 1;
+        }
+        return SpanData::new(Id::new(0), Id::new(0), Metadata::new("unknown", "", Level::Info, ""));
+    }
+}
+
+impl LookupSpan for Registry {
+    fn span_data(&self, id: Id) -> SpanData {
+        return self.span_ref(id);
+    }
+
+    fn span_exists(&self, id: Id) -> bool {
+        let mut i: u64 = 0;
+        while i < self.span_data.len() {
+            if self.span_data[i].id == id && !self.span_data[i].is_closed {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    fn current_span_id(&self) -> Id {
+        return self.current_span_id;
+    }
+
+    fn record_span(&mut self, id: Id, field: Field, value: Value) {
+        self.record(id, field, value);
+    }
+
+    fn record_follows_from(&mut self, id: Id, follows: Id) {
+        self.record_follows_from(id, follows);
+    }
+}
+
+// ============================================================================
+// tracing-log — bridging log records to tracing
+// ============================================================================
+
+pub mod log_compat {
+    use @log/tracing;
+
+    pub struct LogTracer {
+        enabled: bool,
+    }
+
+    pub struct LogEvent {
+        pub level: LogLevel,
+        pub target: String,
+        pub message: String,
+        pub module_path: String,
+        pub file: String,
+        pub line: u64,
+        pub fields: Vec<(String, String)>,
+    }
+
+    pub enum LogLevel {
+        Error,
+        Warn,
+        Info,
+        Debug,
+        Trace,
+    }
+
+    impl LogLevel {
+        pub fn to_tracing_level(level: LogLevel) -> Level {
+            return match level {
+                LogLevel::Error => Level::Error,
+                LogLevel::Warn => Level::Warn,
+                LogLevel::Info => Level::Info,
+                LogLevel::Debug => Level::Debug,
+                LogLevel::Trace => Level::Trace,
+            };
+        }
+    }
+
+    impl LogEvent {
+        pub fn new(level: LogLevel, target: String, message: String) -> LogEvent {
+            return LogEvent {
+                level: level,
+                target: target,
+                message: message,
+                module_path: "",
+                file: "",
+                line: 0,
+                fields: Vec::new(),
+            };
+        }
+
+        pub fn to_tracing_event(&self) -> Event {
+            let level = LogLevel::to_tracing_level(self.level);
+            let metadata = Metadata::new(self.target, self.module_path, level, self.message);
+            return Event::new(metadata, self.fields);
+        }
+    }
+
+    impl LogTracer {
+        pub fn new() -> LogTracer {
+            return LogTracer { enabled: true };
+        }
+
+        pub fn init() {
+            let tracer = LogTracer::new();
+            set_log_tracer(tracer);
+        }
+
+        pub fn init_with_filter(level: LogLevel) {
+            let tracer = LogTracer { enabled: true };
+            set_log_tracer(tracer);
+        }
+
+        pub fn enabled(&self, level: LogLevel) -> bool {
+            return self.enabled;
+        }
+
+        pub fn log(&self, event: LogEvent) {
+            if !self.enabled {
+                return;
+            }
+            let tracing_event = event.to_tracing_event();
+            dispatch_log_event(tracing_event);
+        }
+    }
+}
+
+// ============================================================================
+// tracing-serde — serde serialization support for events
+// ============================================================================
+
+pub mod serde_support {
+    use @data/serde;
+
+    pub fn serialize_event(event: Event) -> String {
+        return json_format(event);
+    }
+
+    pub fn serialize_span(span_data: SpanData) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        parts.push("{");
+        parts.push("\"id\": ");
+        parts.push(span_data.id.value().to_string());
+        parts.push(", \"name\": \"");
+        parts.push(span_data.name());
+        parts.push("\", \"target\": \"");
+        parts.push(span_data.target());
+        parts.push("\", \"level\": \"");
+        parts.push(span_data.level().to_string());
+        parts.push("\", \"fields\": {");
+
+        let mut i: u64 = 0;
+        while i < span_data.fields.len() {
+            if i > 0 {
+                parts.push(", ");
+            }
+            parts.push("\"");
+            parts.push(span_data.fields[i].0);
+            parts.push("\": \"");
+            parts.push(span_data.fields[i].1);
+            parts.push("\"");
+            i = i + 1;
+        }
+
+        parts.push("}");
+        if span_data.parent_id.value() != 0 {
+            parts.push(", \"parent_id\": ");
+            parts.push(span_data.parent_id.value().to_string());
+        }
+        parts.push("}");
+
+        let mut result = "";
+        i = 0;
+        while i < parts.len() {
+            result = result + parts[i];
+            i = i + 1;
+        }
+        return result;
+    }
+}
+
+// ============================================================================
+// internal helpers
+// ============================================================================
+
+fn json_format(event: Event) -> String {
+    let metadata = event.metadata();
+    let level = metadata.level();
+    let target = metadata.target();
+    let message = event.message();
+
+    let ts = std_time();
+    let mut result = "{";
+    result = result + "\"timestamp\": \"" + ts + "\"";
+    result = result + ", \"level\": \"" + level.to_string() + "\"";
+    result = result + ", \"target\": \"" + target + "\"";
+    result = result + ", \"message\": \"" + message + "\"";
+    result = result + "}";
+    return result;
+}
+
+fn std_time() -> String {
+    // Simplified timestamp
+    return "2025-01-01T00:00:00Z";
+}
+
+fn env(key: String) -> String {
+    // Stub: would read from environment
+    return "";
+}
+
+// Global subscriber state
+static mut global_subscriber: SubscriberRef;
+static mut log_tracer: LogTracerRef;
+
+struct SubscriberRef {
+    subscriber: FmtSubscriber,
+    has_subscriber: bool,
+}
+
+struct LogTracerRef {
+    tracer: log_compat::LogTracer,
+    has_tracer: bool,
+}
+
+fn set_global_subscriber(subscriber: FmtSubscriber) {
+    global_subscriber = SubscriberRef {
+        subscriber: subscriber,
+        has_subscriber: true,
+    };
+}
+
+pub fn get_global_subscriber() -> FmtSubscriber {
+    if global_subscriber.has_subscriber {
+        return global_subscriber.subscriber;
+    }
+    return FmtSubscriber::new();
+}
+
+fn set_log_tracer(tracer: log_compat::LogTracer) {
+    log_tracer = LogTracerRef {
+        tracer: tracer,
+        has_tracer: true,
+    };
+}
+
+fn dispatch_log_event(event: Event) {
+    if global_subscriber.has_subscriber {
+        global_subscriber.subscriber.event(event);
+    }
+}
+
+// Initialize statics
+global_subscriber = SubscriberRef {
+    subscriber: FmtSubscriber::new(),
+    has_subscriber: false,
+};
+
+log_tracer = LogTracerRef {
+    tracer: log_compat::LogTracer::new(),
+    has_tracer: false,
+};
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+pub mod tests {
+    pub fn test_env_filter_parse() {
+        let filter = EnvFilter::parse("info");
+        assert(filter.default_level == LevelFilter::Info);
+
+        let filter2 = EnvFilter::parse("warn,crate_a=debug,crate_b=error");
+        assert(filter2.default_level == LevelFilter::Warn);
+        assert(filter2.directives.len() == 2);
+        assert(filter2.enabled("crate_a", Level::Debug));
+        assert(!filter2.enabled("crate_a", Level::Trace));
+        assert(filter2.enabled("crate_b", Level::Error));
+        assert(!filter2.enabled("crate_b", Level::Warn));
+        assert(filter2.enabled("other", Level::Warn));
+        assert(!filter2.enabled("other", Level::Info));
+    }
+
+    pub fn test_env_filter_from_env() {
+        let filter = EnvFilter::from_env();
+        // Would read from RUST_LOG
+    }
+
+    pub fn test_builder_defaults() {
+        let builder = FmtSubscriber::builder();
+        assert(builder.with_target);
+        assert(builder.with_level);
+        assert(!builder.with_line_number);
+        assert(!builder.with_thread_ids);
+        assert(!builder.with_thread_names);
+    }
+
+    pub fn test_builder_config() {
+        let builder = FmtSubscriber::builder()
+            .with_target(false)
+            .with_level(false)
+            .with_line_number(true)
+            .json();
+        assert(!builder.with_target);
+        assert(!builder.with_level);
+        assert(builder.with_line_number);
+        // json should set format to Json and ansi to false
+    }
+
+    pub fn test_builder_compact() {
+        let builder = FmtSubscriber::builder().compact();
+        assert(!builder.with_target);
+    }
+
+    pub fn test_builder_pretty() {
+        let builder = FmtSubscriber::builder().pretty();
+        // pretty format selected
+    }
+
+    pub fn test_env_filter_enabled() {
+        let filter = EnvFilter::parse("trace");
+        assert(filter.enabled("my_crate", Level::Trace));
+        assert(filter.enabled("my_crate", Level::Debug));
+        assert(filter.enabled("my_crate", Level::Info));
+        assert(filter.enabled("my_crate", Level::Warn));
+        assert(filter.enabled("my_crate", Level::Error));
+    }
+
+    pub fn test_env_filter_off() {
+        let filter = EnvFilter::parse("off");
+        assert(!filter.enabled("anything", Level::Trace));
+        assert(!filter.enabled("anything", Level::Error));
+    }
+
+    pub fn test_env_filter_module() {
+        let filter = EnvFilter::parse("info,crate_a=debug,crate_b=error");
+        assert(filter.enabled("crate_a::module", Level::Debug));
+        assert(filter.enabled("crate_b", Level::Error));
+        assert(!filter.enabled("crate_b", Level::Warn));
+    }
+
+    pub fn test_style_text() {
+        let styled = style_text("hello".to_string(), Style::Red);
+        assert(styled.starts_with("\x1b[31m"));
+        assert(styled.ends_with("\x1b[0m"));
+        assert(styled.contains("hello"));
+    }
+
+    pub fn test_matcher_exact() {
+        let m = Matcher::new_exact("hello".to_string());
+        assert(m.matches("hello".to_string()));
+        assert(!m.matches("hello world".to_string()));
+    }
+
+    pub fn test_matcher_wildcard() {
+        let m = Matcher::new("world".to_string());
+        assert(m.matches("hello world".to_string()));
+        assert(!m.matches("hello".to_string()));
+    }
+
+    pub fn test_registry_new_span() {
+        let mut registry = Registry::new();
+        let id = Id::new(42);
+        let metadata = Metadata::new("test_span", "my_crate", Level::Info, "a test span");
+        let data = SpanData::new(id, Id::new(0), metadata);
+        registry.new_span(data);
+        assert(registry.span_exists(id));
+    }
+
+    pub fn test_registry_enter_exit() {
+        let mut registry = Registry::new();
+        let id = Id::new(7);
+        assert(registry.current_span_id.value() == 0);
+        registry.enter(id);
+        assert(registry.current_span_id == id);
+        registry.exit(id);
+        assert(registry.current_span_id.value() == 0);
+    }
+
+    pub fn test_registry_clone_and_close() {
+        let mut registry = Registry::new();
+        let id = Id::new(1);
+        let metadata = Metadata::new("test", "crate", Level::Info, "test");
+        let data = SpanData::new(id, Id::new(0), metadata);
+        registry.new_span(data);
+
+        let cloned = registry.clone_span(id);
+        assert(cloned == id);
+
+        let closed = registry.try_close(id);
+        assert(!closed); // ref_count still 1 from clone
+
+        let data2 = registry.span_ref(id);
+        assert(data2.ref_count == 1);
+
+        let closed2 = registry.try_close(id);
+        assert(closed2); // ref_count now 0
+        assert(data2.is_closed);
+    }
+
+    pub fn test_log_tracer_basic() {
+        let tracer = log_compat::LogTracer::new();
+        assert(tracer.enabled(log_compat::LogLevel::Info));
+
+        let event = log_compat::LogEvent::new(
+            log_compat::LogLevel::Info,
+            "my_app".to_string(),
+            "hello from log".to_string(),
+        );
+        let tracing_event = event.to_tracing_event();
+        assert(tracing_event.metadata().target() == "my_app");
+    }
+
+    pub fn test_log_level_conversion() {
+        let pairs: Vec<(log_compat::LogLevel, Level)> = Vec::new();
+        pairs.push((log_compat::LogLevel::Error, Level::Error));
+        pairs.push((log_compat::LogLevel::Warn, Level::Warn));
+        pairs.push((log_compat::LogLevel::Info, Level::Info));
+        pairs.push((log_compat::LogLevel::Debug, Level::Debug));
+        pairs.push((log_compat::LogLevel::Trace, Level::Trace));
+
+        let mut i: u64 = 0;
+        while i < pairs.len() {
+            let (log_lvl, tracing_lvl) = pairs[i];
+            assert(log_compat::LogLevel::to_tracing_level(log_lvl) == tracing_lvl);
+            i = i + 1;
+        }
+    }
+
+    pub fn test_json_serialization() {
+        let event = create_test_event();
+        let json_str = serde_support::serialize_event(event);
+        assert(json_str.contains("\"level\""));
+        assert(json_str.contains("\"message\""));
+        assert(json_str.contains("\"target\""));
+    }
+
+    pub fn test_span_serialization() {
+        let id = Id::new(42);
+        let metadata = Metadata::new("test_span", "crate", Level::Info, "test");
+        let mut data = SpanData::new(id, Id::new(1), metadata);
+        data.fields.push(("key".to_string(), "value".to_string()));
+
+        let json_str = serde_support::serialize_span(data);
+        assert(json_str.contains("\"id\": 42"));
+        assert(json_str.contains("\"name\": \"test_span\""));
+        assert(json_str.contains("\"key\": \"value\""));
+    }
+
+    pub fn test_make_writer_stdout() {
+        let writer = FmtWriter::stdout();
+        let made = writer.make_writer();
+        // Should return Stdout variant
+    }
+
+    pub fn test_make_writer_stderr() {
+        let writer = FmtWriter::stderr();
+        let made = writer.make_writer();
+        // Should return Stderr variant
+    }
+
+    pub fn test_fmt_writer_custom() {
+        let mut writer = FmtWriter::Custom { buffer: String::new() };
+        writer.write("hello".to_string());
+        match writer {
+            FmtWriter::Custom { buffer } => {
+                assert(buffer == "hello");
+            },
+            _ => {
+                assert(false);
+            },
+        }
+    }
+
+    pub fn test_level_filter_allows() {
+        assert(LevelFilter::Trace.allows(LevelFilter::Trace));
+        assert(LevelFilter::Trace.allows(LevelFilter::Debug));
+        assert(LevelFilter::Trace.allows(LevelFilter::Info));
+        assert(LevelFilter::Info.allows(LevelFilter::Info));
+        assert(LevelFilter::Info.allows(LevelFilter::Warn));
+        assert(!LevelFilter::Info.allows(LevelFilter::Debug));
+        assert(!LevelFilter::Info.allows(LevelFilter::Trace));
+        assert(LevelFilter::Off.allows(LevelFilter::Off));
+        assert(!LevelFilter::Off.allows(LevelFilter::Error));
+    }
+
+    pub fn test_identity_layer() {
+        let mut identity = Identity::new();
+        let metadata = Metadata::new("test", "crate", Level::Info, "test");
+        assert(identity.enabled(metadata));
+        assert(identity.on_event_enabled(metadata));
+    }
+
+    pub fn test_stack_basic() {
+        let mut stack = Stack::new();
+        assert(stack.is_empty());
+        assert(stack.len() == 0);
+        let layer = LayerRef { id: 1 };
+        stack.push(layer);
+        assert(!stack.is_empty());
+        assert(stack.len() == 1);
+    }
+
+    pub fn test_text_formatter_basic() {
+        let formatter = TextFormatter::new();
+        let mut writer = FmtWriter::Custom { buffer: String::new() };
+        let event = create_test_event();
+        formatter.format_event(event, &mut writer);
+        match writer {
+            FmtWriter::Custom { buffer } => {
+                assert(buffer.len() > 0);
+            },
+            _ => {},
+        }
+    }
+
+    pub fn test_json_formatter() {
+        let formatter = TextFormatter::new();
+        let mut writer = FmtWriter::Custom { buffer: String::new() };
+        let event = create_test_event();
+        formatter.format_json(event, &mut writer);
+        match writer {
+            FmtWriter::Custom { buffer } => {
+                assert(buffer.len() > 0);
+                assert(buffer.starts_with("{"));
+            },
+            _ => {},
+        }
+    }
+
+    pub fn test_ansi_style_all() {
+        let styles: Vec<Style> = Vec::new();
+        styles.push(Style::Red);
+        styles.push(Style::Green);
+        styles.push(Style::Yellow);
+        styles.push(Style::Blue);
+        styles.push(Style::Magenta);
+        styles.push(Style::Cyan);
+        styles.push(Style::White);
+        styles.push(Style::Bold);
+        styles.push(Style::Dim);
+        styles.push(Style::Italic);
+        styles.push(Style::BrightRed);
+
+        let mut i: u64 = 0;
+        while i < styles.len() {
+            let code = ansi_style(styles[i]);
+            assert(code.len() > 0);
+            assert(code.starts_with("\x1b["));
+            i = i + 1;
+        }
+    }
+
+    pub fn test_sharded_slab_basic() {
+        let mut slab = ShardedSlab::new();
+        let metadata = Metadata::new("test", "crate", Level::Info, "test");
+        let span = SpanData::new(Id::new(1), Id::new(0), metadata);
+        let id = slab.insert(span);
+        assert(id > 0);
+        assert(slab.contains(id));
+        slab.remove(id);
+        assert(!slab.contains(id));
+    }
+}
+
+fn create_test_event() -> Event {
+    let metadata = Metadata::new("test_target", "my_crate", Level::Info, "test message");
+    return Event::new(metadata, Vec::new());
+}
